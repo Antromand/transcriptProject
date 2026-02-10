@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { isValidVkMask } from "./vkUrlRules";
 
 /**
  * MVP (VK-only)
@@ -9,45 +10,6 @@ import React, { useMemo, useState } from "react";
  * 4) split_whisperx.py -> чанки
  * 5) ChatGPT -> краткий пересказ
  */
-
-function detectHosting(rawUrl) {
-  try {
-    const url = new URL(rawUrl.trim());
-    const host = url.hostname.toLowerCase();
-
-    const isVK =
-      host === "vk.com" || host.endsWith(".vk.com") || host === "vkvideo.ru" || host.endsWith(".vkvideo.ru");
-
-    if (isVK) return "vk";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-function isValidVkMask(rawUrl) {
-  try {
-    const url = new URL(rawUrl.trim());
-    const host = url.hostname.toLowerCase();
-
-    if (host === "vk.com" || host.endsWith(".vk.com")) {
-      // https://vk.com/{sometext}?z=video-{somenumber}
-      if (!url.pathname || url.pathname === "/") return false;
-      if (!url.searchParams.has("z")) return false;
-      const z = url.searchParams.get("z") || "";
-      return /^video-\d+(_\d+)?$/.test(z);
-    }
-
-    if (host === "vkvideo.ru" || host.endsWith(".vkvideo.ru")) {
-      // https://vkvideo.ru/video-{somenumber}
-      return /^\/video-\d+(_\d+)?$/.test(url.pathname || "");
-    }
-
-    return false;
-  } catch {
-    return false;
-  }
-}
 
 function clampInt(value, min, max) {
   const n = Number.parseInt(String(value), 10);
@@ -88,8 +50,7 @@ const STEP_LABELS = [
 
 export default function App() {
   const [url, setUrl] = useState("");
-  const hosting = useMemo(() => detectHosting(url), [url]);
-  const isLinkValid = useMemo(() => url.trim().length > 0 && hosting === "vk" && isValidVkMask(url), [url, hosting]);
+  const isLinkValid = useMemo(() => url.trim().length > 0 && isValidVkMask(url), [url]);
 
   const [mode, setMode] = useState("summary"); // summary
 
@@ -107,7 +68,7 @@ export default function App() {
   const [abortCtrl, setAbortCtrl] = useState(null);
   const [error, setError] = useState("");
 
-  const canRun = url.trim().length > 0 && mode === "summary" && hosting === "vk";
+  const canRun = url.trim().length > 0 && mode === "summary" && isLinkValid;
 
   function applyDefaultsOnToggle(nextUseDefaults) {
     setUseDefaults(nextUseDefaults);

@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import OpenAI from "openai";
+import { isValidVkMask } from "../ui/src/vkUrlRules.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const WORK_ROOT = process.env.WORK_ROOT || path.join(process.cwd(), "work");
@@ -35,16 +36,6 @@ function run(cmd, args, { cwd } = {}) {
       else reject(new Error(`${cmd} ${args.join(" ")}\n${err || out}`));
     });
   });
-}
-
-function isVkUrl(raw) {
-  try {
-    const u = new URL(raw);
-    const h = u.hostname.toLowerCase();
-    return h === "vk.com" || h.endsWith(".vk.com") || h === "vk.ru" || h.endsWith(".vk.ru");
-  } catch {
-    return false;
-  }
 }
 
 async function listCandidateChunkFiles(jobDir) {
@@ -120,7 +111,7 @@ app.post("/api/vk/summary", async (req, res) => {
   const wordLimit = options?.word_limit ?? null;
 
   if (!url || typeof url !== "string") return res.status(400).json({ error: "Missing url" });
-  if (!isVkUrl(url)) return res.status(400).json({ error: "VK-only: unsupported url" });
+  if (!isValidVkMask(url)) return res.status(400).json({ error: "VK-only: unsupported url" });
 
   const jobId = crypto.randomUUID();
   const jobDir = path.join(WORK_ROOT, jobId);
