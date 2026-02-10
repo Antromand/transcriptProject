@@ -1,0 +1,13 @@
+{
+  "name": "vk-video-summarizer-mvp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node server/index.mjs",
+    "dev:ui": "npm --prefix ui run dev",
+    "build": "npm --prefix ui run build",
+    "start": "node server/index.mjs"
+  }
+}
