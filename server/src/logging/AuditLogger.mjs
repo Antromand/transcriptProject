@@ -4,9 +4,10 @@ import fs from "node:fs/promises";
 const PIPELINE_STEP_NAMES = ["download_audio", "whisperx_transcription", "split_chunks", "llm_summary"];
 
 export class AuditLogger {
-  constructor({ workRoot, auditLogPath }) {
+  constructor({ workRoot, auditLogPath, keepLastRecords = 20 }) {
     this.workRoot = workRoot;
     this.auditLogPath = auditLogPath || path.join(workRoot, "audit", "audit-log.jsonl");
+    this.keepLastRecords = Number.isFinite(keepLastRecords) && keepLastRecords > 0 ? keepLastRecords : 20;
   }
 
   getMonthlyAuditLogPath(isoDate) {
@@ -54,8 +55,24 @@ export class AuditLogger {
       const logPath = this.getMonthlyAuditLogPath(record?.finished_at || record?.started_at || new Date().toISOString());
       await fs.mkdir(path.dirname(logPath), { recursive: true });
       await fs.appendFile(logPath, `${JSON.stringify(record)}\n`, "utf-8");
+      await this.trimToLastRecords(logPath);
     } catch (e) {
       console.error("Failed to write audit log:", e?.message || e);
     }
+  }
+
+  async trimToLastRecords(logPath) {
+    if (!this.keepLastRecords || this.keepLastRecords < 1) {
+      return;
+    }
+
+    const raw = await fs.readFile(logPath, "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    if (lines.length <= this.keepLastRecords) {
+      return;
+    }
+
+    const kept = lines.slice(-this.keepLastRecords);
+    await fs.writeFile(logPath, `${kept.join("\n")}\n`, "utf-8");
   }
 }

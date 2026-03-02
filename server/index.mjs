@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { isValidVkMask } from "../ui/src/vkUrlRules.js";
-import { AppConfig } from "./src/config/AppConfig.mjs";
+import { AppConfig } from "../AppConfig.mjs";
 import { LLMService } from "./src/llm/LLMService.mjs";
 import { SummaryPipelineService } from "./src/pipeline/SummaryPipelineService.mjs";
 import { SummaryJobStore } from "./src/jobs/SummaryJobStore.mjs";
@@ -30,7 +30,11 @@ const pipelineService = new SummaryPipelineService({
   env: process.env,
 });
 const jobStore = new SummaryJobStore({ ttlMs: 30 * 60 * 1000 });
-const auditLogger = new AuditLogger({ workRoot: config.workRoot, auditLogPath: config.auditLogPath });
+const auditLogger = new AuditLogger({
+  workRoot: config.workRoot,
+  auditLogPath: config.auditLogPath,
+  keepLastRecords: config.auditLogKeepLast,
+});
 const summaryController = new SummaryController({
   isValidVkMask,
   llmService,
