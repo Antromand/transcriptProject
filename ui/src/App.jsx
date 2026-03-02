@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+﻿import React, { useEffect, useMemo, useState } from "react";
 import { isValidVkMask } from "./vkUrlRules";
 
 /**
@@ -61,18 +61,90 @@ async function getJson(url, signal) {
   return json;
 }
 
-const STEP_LABELS = [
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    if (!signal) return;
+    const onAbort = () => {
+      clearTimeout(timer);
+      const err = new Error("Aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+const BASE_STEP_LABELS = [
   "Скачивание аудио (yt-dlp → wav)",
   "Транскрипция (WhisperX + diarization → txt)",
   "Разбиение на чанки (split_whisperx.py)",
-  "Краткий пересказ (ChatGPT)",
 ];
+
+const LLM_OPTIONS = [
+  {
+    id: "openai",
+    label: "ChatGPT",
+    keyName: "OPENAI_API_KEY",
+    keyStatusField: "openai_api_key_set",
+    placeholder: "sk-...",
+    keyUrl: "https://platform.openai.com/api-keys",
+    keyHelp: "Получить API-ключ: OpenAI Platform -> API keys.",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    keyName: "DEEPSEEK_API_KEY",
+    keyStatusField: "deepseek_api_key_set",
+    placeholder: "sk-...",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    keyHelp: "Получить API-ключ: DeepSeek Platform -> API Keys.",
+  },
+  {
+    id: "grok",
+    label: "Grok",
+    keyName: "GROK_API_KEY",
+    keyStatusField: "grok_api_key_set",
+    placeholder: "xai-...",
+    keyUrl: "https://console.x.ai/",
+    keyHelp: "Получить API-ключ: xAI Console -> API keys.",
+  },
+  {
+    id: "gemini",
+    label: "Google Gemini",
+    keyName: "GEMINI_API_KEY",
+    keyStatusField: "gemini_api_key_set",
+    placeholder: "AIza...",
+    keyUrl: "https://aistudio.google.com/app/apikey",
+    keyHelp: "Получить API-ключ: Google AI Studio -> API keys.",
+  },
+  {
+    id: "yandexgpt",
+    label: "YandexGPT",
+    keyName: "YANDEXGPT_API_KEY",
+    keyStatusField: "yandexgpt_api_key_set",
+    placeholder: "AQVN...",
+    keyUrl: "https://oauth.yandex.ru/",
+    keyHelp: "Для 300.ya.ru используйте OAuth-токен Яндекса (формат AQVN...).",
+  },
+];
+
+function buildStepLabels(providerId) {
+  const provider = LLM_OPTIONS.find((p) => p.id === providerId);
+  const llmLabel = provider?.label || "LLM";
+  return [...BASE_STEP_LABELS, `Краткий пересказ (${llmLabel})`];
+}
 
 export default function App() {
   const [url, setUrl] = useState("");
   const isLinkValid = useMemo(() => url.trim().length > 0 && isValidVkMask(url), [url]);
 
   const [mode, setMode] = useState("summary"); // summary
+  const [llmProvider, setLlmProvider] = useState("openai");
 
   // Опции пересказа
   const [useDefaults, setUseDefaults] = useState(true);
@@ -86,49 +158,138 @@ export default function App() {
   const [pipelineLog, setPipelineLog] = useState("");
   const [warnings, setWarnings] = useState([]);
   const [stepIndex, setStepIndex] = useState(-1);
+  const [stepDurationsMs, setStepDurationsMs] = useState([]);
+  const [activeStepStartedAt, setActiveStepStartedAt] = useState(null);
+  const [activeStepElapsedMs, setActiveStepElapsedMs] = useState(0);
   const [abortCtrl, setAbortCtrl] = useState(null);
   const [error, setError] = useState("");
-  const [openAiKey, setOpenAiKey] = useState("");
+  const [llmKeys, setLlmKeys] = useState({
+    openai: "",
+    deepseek: "",
+    grok: "",
+    gemini: "",
+    yandexgpt: "",
+  });
   const [hfToken, setHfToken] = useState("");
-  const [envStatus, setEnvStatus] = useState({ openai_api_key_set: false, hf_token_set: false });
-  const [envMsg, setEnvMsg] = useState("");
+  const [envStatus, setEnvStatus] = useState({
+    openai_api_key_set: false,
+    deepseek_api_key_set: false,
+    grok_api_key_set: false,
+    gemini_api_key_set: false,
+    yandexgpt_api_key_set: false,
+    hf_token_set: false,
+  });
+  const [toasts, setToasts] = useState([]);
   const [envBusy, setEnvBusy] = useState(false);
+  const [showLlmKey, setShowLlmKey] = useState(false);
+  const stepLabels = useMemo(() => buildStepLabels(llmProvider), [llmProvider]);
+  const selectedProvider = useMemo(
+    () => LLM_OPTIONS.find((p) => p.id === llmProvider) || LLM_OPTIONS[0],
+    [llmProvider]
+  );
 
   const canRun = url.trim().length > 0 && mode === "summary" && isLinkValid;
 
   useEffect(() => {
-    onCheckEnv().catch(() => {});
+    syncEnvStatus().catch(() => {});
   }, []);
 
-  async function onCheckEnv() {
+  useEffect(() => {
+    if (!isRunning || activeStepStartedAt === null) return undefined;
+    const timer = setInterval(() => {
+      setActiveStepElapsedMs(Date.now() - activeStepStartedAt);
+    }, 200);
+    return () => clearInterval(timer);
+  }, [isRunning, activeStepStartedAt]);
+
+  useEffect(() => {
+    if (!isRunning || stepIndex < 0) return;
+    setActiveStepStartedAt(Date.now());
+    setActiveStepElapsedMs(0);
+  }, [isRunning, stepIndex]);
+
+  function pushToast(message, tone = "info") {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setToasts((prev) => [...prev, { id, message, tone }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 5000);
+  }
+
+  function pushStatusToast(prefix, isSet) {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setToasts((prev) => [...prev, { id, tone: "info", prefix, isSet }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 5000);
+  }
+
+  async function syncEnvStatus() {
+    const data = await getJson("/api/env/status");
+    const nextStatus = {
+      openai_api_key_set: Boolean(data?.openai_api_key_set),
+      deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
+      grok_api_key_set: Boolean(data?.grok_api_key_set),
+      gemini_api_key_set: Boolean(data?.gemini_api_key_set),
+      yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
+      hf_token_set: Boolean(data?.hf_token_set),
+    };
+    setEnvStatus(nextStatus);
+    return nextStatus;
+  }
+
+  async function onCheckLlmStatus() {
     setEnvBusy(true);
-    setEnvMsg("");
     try {
-      const data = await getJson("/api/env/status");
-      setEnvStatus({
-        openai_api_key_set: Boolean(data?.openai_api_key_set),
-        hf_token_set: Boolean(data?.hf_token_set),
-      });
-      setEnvMsg("Проверка выполнена.");
+      const nextStatus = await syncEnvStatus();
+      const isSet = Boolean(nextStatus[selectedProvider.keyStatusField]);
+      pushStatusToast(`API-ключ для ${selectedProvider.label} `, isSet);
     } catch (e) {
-      setEnvMsg(e?.message || "Не удалось проверить переменные.");
+      pushToast(e?.message || "Не удалось проверить переменные.", "error");
     } finally {
       setEnvBusy(false);
     }
   }
 
-  async function onSetOpenAI() {
+  async function onCheckHFStatus() {
     setEnvBusy(true);
-    setEnvMsg("");
     try {
-      const data = await postJson("/api/env/set", { openai_api_key: openAiKey });
+      const nextStatus = await syncEnvStatus();
+      pushStatusToast("HF_TOKEN ", Boolean(nextStatus.hf_token_set));
+    } catch (e) {
+      pushToast(e?.message || "Не удалось проверить переменные.", "error");
+    } finally {
+      setEnvBusy(false);
+    }
+  }
+
+  async function onSetLlmKey() {
+    setEnvBusy(true);
+    try {
+      const keyFieldByProvider = {
+        openai: "openai_api_key",
+        deepseek: "deepseek_api_key",
+        grok: "grok_api_key",
+        gemini: "gemini_api_key",
+        yandexgpt: "yandexgpt_api_key",
+      };
+      const field = keyFieldByProvider[llmProvider] || "openai_api_key";
+      const keyValue = llmKeys[llmProvider] || "";
+      const data = await postJson("/api/env/set", { [field]: keyValue });
       setEnvStatus({
         openai_api_key_set: Boolean(data?.openai_api_key_set),
+        deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
+        grok_api_key_set: Boolean(data?.grok_api_key_set),
+        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
-      setEnvMsg(data?.openai_api_key_set ? "OPENAI_API_KEY сохранен в серверном процессе." : "OPENAI_API_KEY очищен.");
+      const isSet = Boolean(data?.[selectedProvider.keyStatusField]);
+      pushToast(
+        isSet ? `${selectedProvider.keyName} сохранен в серверном процессе.` : `${selectedProvider.keyName} очищен.`,
+        "success"
+      );
     } catch (e) {
-      setEnvMsg(e?.message || "Не удалось сохранить OPENAI_API_KEY.");
+      pushToast(e?.message || `Не удалось сохранить ${selectedProvider.keyName}.`, "error");
     } finally {
       setEnvBusy(false);
     }
@@ -136,16 +297,18 @@ export default function App() {
 
   async function onSetHF() {
     setEnvBusy(true);
-    setEnvMsg("");
     try {
       const data = await postJson("/api/env/set", { hf_token: hfToken });
       setEnvStatus({
         openai_api_key_set: Boolean(data?.openai_api_key_set),
+        deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
+        grok_api_key_set: Boolean(data?.grok_api_key_set),
+        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
-      setEnvMsg(data?.hf_token_set ? "HF_TOKEN сохранен в серверном процессе." : "HF_TOKEN очищен.");
+      pushToast(data?.hf_token_set ? "HF_TOKEN сохранен в серверном процессе." : "HF_TOKEN очищен.", "success");
     } catch (e) {
-      setEnvMsg(e?.message || "Не удалось сохранить HF_TOKEN.");
+      pushToast(e?.message || "Не удалось сохранить HF_TOKEN.", "error");
     } finally {
       setEnvBusy(false);
     }
@@ -167,6 +330,9 @@ export default function App() {
     setPipelineLog("");
     setWarnings([]);
     setStepIndex(-1);
+    setStepDurationsMs([]);
+    setActiveStepStartedAt(null);
+    setActiveStepElapsedMs(0);
 
     const trimmed = url.trim();
     if (!trimmed) {
@@ -203,38 +369,69 @@ export default function App() {
     setIsRunning(true);
     try {
       setStepIndex(0);
-      const json = await postJson(
+      setActiveStepStartedAt(Date.now());
+      setActiveStepElapsedMs(0);
+      const startJson = await postJson(
         "/api/vk/summary",
         {
           url: trimmed,
           options: {
+            llm_provider: llmProvider,
             word_limit: wl, // null => default
             clean: cleanFiller,
             log: showLog,
+            async: true,
           },
         },
         ctrl.signal
       );
 
-      if (typeof json?.steps === "number") setStepIndex(Math.min(STEP_LABELS.length - 1, json.steps));
-      else setStepIndex(STEP_LABELS.length - 1);
+      if (startJson?.job_id) {
+        while (true) {
+          await delay(700, ctrl.signal);
+          const statusJson = await getJson(`/api/vk/summary/status/${startJson.job_id}`, ctrl.signal);
 
-      setResultText(json?.summary || "");
-      setPipelineLog(json?.log || "");
-      setWarnings(Array.isArray(json?.warnings) ? json.warnings : []);
+          if (typeof statusJson?.steps === "number") setStepIndex(Math.min(stepLabels.length - 1, statusJson.steps));
+          setWarnings(Array.isArray(statusJson?.warnings) ? statusJson.warnings : []);
+          setStepDurationsMs(Array.isArray(statusJson?.step_durations_ms) ? statusJson.step_durations_ms : []);
+          if (showLog) setPipelineLog(statusJson?.log || "");
 
-      if (!json?.summary) {
-        setError("Backend не вернул пересказ.");
+          if (statusJson?.status === "done") {
+            setStepIndex(stepLabels.length);
+            setActiveStepStartedAt(null);
+            setResultText(statusJson?.summary || "");
+            if (!statusJson?.summary) setError("Backend не вернул пересказ.");
+            break;
+          }
+          if (statusJson?.status === "error") {
+            setActiveStepStartedAt(null);
+            setError(statusJson?.error || "Не удалось выполнить пересказ.");
+            break;
+          }
+        }
+      } else {
+        if (typeof startJson?.steps === "number") setStepIndex(Math.min(stepLabels.length, startJson.steps + 1));
+        else setStepIndex(stepLabels.length);
+        setActiveStepStartedAt(null);
+        setResultText(startJson?.summary || "");
+        setPipelineLog(startJson?.log || "");
+        setWarnings(Array.isArray(startJson?.warnings) ? startJson.warnings : []);
+        setStepDurationsMs(Array.isArray(startJson?.step_durations_ms) ? startJson.step_durations_ms : []);
+        if (!startJson?.summary) {
+          setError("Backend не вернул пересказ.");
+        }
       }
     } catch (e) {
       if (e?.name === "AbortError") {
         setError("Операция отменена.");
       } else {
         setWarnings(Array.isArray(e?.data?.warnings) ? e.data.warnings : []);
+        setStepDurationsMs(Array.isArray(e?.data?.step_durations_ms) ? e.data.step_durations_ms : []);
         setError(e?.message || "Не удалось выполнить пересказ.");
       }
     } finally {
       setIsRunning(false);
+      setActiveStepStartedAt(null);
       setAbortCtrl(null);
     }
   }
@@ -308,18 +505,58 @@ export default function App() {
               </div>
 
               <div className="mt-4 grid gap-3">
-                <label className="text-sm font-medium">OPENAI_API_KEY</label>
+                <label className="text-sm font-medium">LLM провайдер</label>
+                <select
+                  value={llmProvider}
+                  onChange={(e) => setLlmProvider(e.target.value)}
+                  className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                >
+                  {LLM_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                <label className="text-sm font-medium">{selectedProvider.keyName}</label>
                 <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    type="password"
-                    value={openAiKey}
-                    onChange={(e) => setOpenAiKey(e.target.value)}
-                    placeholder="sk-..."
-                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
-                  />
+                  <div className="relative w-full">
+                    <input
+                      type={showLlmKey ? "text" : "password"}
+                      value={llmKeys[llmProvider] || ""}
+                      onChange={(e) =>
+                        setLlmKeys((prev) => ({
+                          ...prev,
+                          [llmProvider]: e.target.value,
+                        }))
+                      }
+                      placeholder={selectedProvider.placeholder}
+                      className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 pr-10 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowLlmKey((v) => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-900"
+                      aria-label={showLlmKey ? "Скрыть ключ" : "Показать ключ"}
+                      title={showLlmKey ? "Скрыть" : "Показать"}
+                    >
+                      {showLlmKey ? (
+                        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 3l18 18" />
+                          <path d="M10.6 10.6a2 2 0 102.8 2.8" />
+                          <path d="M9.5 5.2A11 11 0 0112 5c5 0 9 4.5 10 7-0.4 1-1.3 2.3-2.5 3.5" />
+                          <path d="M6.7 6.7C4.8 8 3.4 9.7 2 12c1 2.5 5 7 10 7 2.3 0 4.3-.9 6-2.3" />
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z" />
+                          <circle cx="12" cy="12" r="3" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
                   <button
                     type="button"
-                    onClick={onCheckEnv}
+                    onClick={onCheckLlmStatus}
                     disabled={envBusy}
                     className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
                   >
@@ -327,7 +564,7 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={onSetOpenAI}
+                    onClick={onSetLlmKey}
                     disabled={envBusy}
                     className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
                   >
@@ -335,10 +572,15 @@ export default function App() {
                   </button>
                 </div>
                 <div className="text-xs text-neutral-600">
-                  Статус:{" "}
-                  <span className={envStatus.openai_api_key_set ? "text-emerald-700 font-medium" : "text-red-700 font-medium"}>
-                    {envStatus.openai_api_key_set ? "задан" : "не задан"}
-                  </span>
+                  {selectedProvider.keyHelp}{" "}
+                  <a
+                    href={selectedProvider.keyUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-medium text-neutral-900 underline"
+                  >
+                    Открыть
+                  </a>
                 </div>
               </div>
 
@@ -354,7 +596,7 @@ export default function App() {
                   />
                   <button
                     type="button"
-                    onClick={onCheckEnv}
+                    onClick={onCheckHFStatus}
                     disabled={envBusy}
                     className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
                   >
@@ -369,15 +611,8 @@ export default function App() {
                     Сохранить
                   </button>
                 </div>
-                <div className="text-xs text-neutral-600">
-                  Статус:{" "}
-                  <span className={envStatus.hf_token_set ? "text-emerald-700 font-medium" : "text-red-700 font-medium"}>
-                    {envStatus.hf_token_set ? "задан" : "не задан"}
-                  </span>
-                </div>
               </div>
 
-              {envMsg && <div className="mt-3 text-xs text-neutral-700">{envMsg}</div>}
             </div>
 
             {mode === "summary" && (
@@ -489,9 +724,13 @@ export default function App() {
             <div className="rounded-2xl border border-neutral-200 p-4">
               <div className="text-sm font-medium">Пайплайн</div>
               <ol className="mt-2 grid gap-2">
-                {STEP_LABELS.map((label, i) => {
+                {stepLabels.map((label, i) => {
                   const state =
                     stepIndex < 0 ? "idle" : i < stepIndex ? "done" : i === stepIndex ? "active" : "todo";
+                  const durationMs = Number(stepDurationsMs?.[i]);
+                  const hasDuration = Number.isFinite(durationMs) && durationMs >= 0;
+                  const durationText = hasDuration ? `${(durationMs / 1000).toFixed(1)}с` : "";
+                  const liveDurationText = `${(activeStepElapsedMs / 1000).toFixed(1)}с`;
                   return (
                     <li key={label} className="flex items-center justify-between gap-3 text-sm">
                       <div className="flex items-center gap-2">
@@ -509,7 +748,17 @@ export default function App() {
                         <span className={state === "todo" ? "text-neutral-400" : "text-neutral-900"}>{label}</span>
                       </div>
                       <span className="text-xs text-neutral-500">
-                        {state === "done" ? "готово" : state === "active" ? (isRunning ? "в работе" : "") : ""}
+                        {state === "done"
+                          ? hasDuration
+                            ? `готово • ${durationText}`
+                            : "готово"
+                          : state === "active"
+                          ? isRunning
+                            ? `в работе • ${liveDurationText}`
+                            : hasDuration
+                            ? durationText
+                            : ""
+                          : ""}
                       </span>
                     </li>
                   );
@@ -557,9 +806,36 @@ export default function App() {
         </section>
 
         <footer className="mt-6 text-xs text-neutral-500">
-          VK-only MVP. Для работы backend нужны: yt-dlp, ffmpeg, python + whisperx, HF_TOKEN, OPENAI_API_KEY.
+          VK-only MVP. Для работы backend нужны: yt-dlp, ffmpeg, python + whisperx, HF_TOKEN и ключ выбранного LLM.
         </footer>
+      </div>
+
+      <div className="fixed bottom-4 right-4 z-50 flex w-96 max-w-full flex-col gap-2">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className={`rounded-xl px-3 py-2 text-sm shadow-sm ring-1 ${
+              t.tone === "error"
+                ? "border border-red-200 bg-red-50 text-red-800 ring-red-200"
+                : t.tone === "success"
+                ? "border border-emerald-200 bg-emerald-50 text-emerald-800 ring-emerald-200"
+                : "border border-neutral-200 bg-white text-neutral-900 ring-neutral-200"
+            }`}
+          >
+            {typeof t.isSet === "boolean" ? (
+              <>
+                {t.prefix}
+                <span className={t.isSet ? "font-semibold text-emerald-700" : "font-semibold text-red-700"}>
+                  {t.isSet ? "задан" : "не задан"}
+                </span>
+              </>
+            ) : (
+              t.message
+            )}
+          </div>
+        ))}
       </div>
     </div>
   );
 }
+
