@@ -88,3 +88,12 @@ downloads
 docker-data
 
 work/
+
+############################
+# Audit logs
+############################
+audit-log.jsonl
+audit-log*.jsonl
+work/audit-log.jsonl
+work/audit-log*.jsonl
+work/audit/

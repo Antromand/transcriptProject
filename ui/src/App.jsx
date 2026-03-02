@@ -144,7 +144,7 @@ export default function App() {
   const isLinkValid = useMemo(() => url.trim().length > 0 && isValidVkMask(url), [url]);
 
   const [mode, setMode] = useState("summary"); // summary
-  const [llmProvider, setLlmProvider] = useState("openai");
+  const [llmProvider, setLlmProvider] = useState("deepseek");
 
   // Опции пересказа
   const [useDefaults, setUseDefaults] = useState(true);
