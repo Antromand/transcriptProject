@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -12,21 +12,29 @@ const WORK_ROOT = process.env.WORK_ROOT || path.join(process.cwd(), "work");
 const UI_DIST = process.env.UI_DIST || path.join(process.cwd(), "ui", "dist");
 
 const YTDLP = process.env.YTDLP_BIN || "yt-dlp";
-const FFMPEG = process.env.FFMPEG_BIN || "ffmpeg";
 const PYTHON = process.env.PYTHON_BIN || "python";
 
 const WHISPERX_SCRIPT = process.env.WHISPERX_SCRIPT || "run_whisperx.py";
 const SPLIT_SCRIPT = process.env.SPLIT_SCRIPT || "split_whisperx.py";
+const WHISPERX_SCRIPT_PATH = path.isAbsolute(WHISPERX_SCRIPT) ? WHISPERX_SCRIPT : path.join(process.cwd(), WHISPERX_SCRIPT);
+const SPLIT_SCRIPT_PATH = path.isAbsolute(SPLIT_SCRIPT) ? SPLIT_SCRIPT : path.join(process.cwd(), SPLIT_SCRIPT);
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
-const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
+function getOpenAIClient() {
+  const key = process.env.OPENAI_API_KEY;
+  return key ? new OpenAI({ apiKey: key }) : null;
+}
+
+function getPreferredOpenAIModel() {
+  return process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+}
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 function run(cmd, args, { cwd } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd, shell: true });
+    const p = spawn(cmd, args, { cwd });
     let out = "";
     let err = "";
     p.stdout.on("data", (d) => (out += d.toString()));
@@ -36,6 +44,10 @@ function run(cmd, args, { cwd } = {}) {
       else reject(new Error(`${cmd} ${args.join(" ")}\n${err || out}`));
     });
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function listCandidateChunkFiles(jobDir) {
@@ -73,36 +85,134 @@ async function listCandidateChunkFiles(jobDir) {
 }
 
 async function summarizeChunksWithOpenAI(chunks) {
+  const client = getOpenAIClient();
   if (!client) {
     return {
-      summary: "OPENAI_API_KEY не задан. Установите переменную окружения и перезапустите сервер.",
+      summary: "OPENAI_API_KEY не задан. Задайте ключ в UI (или через переменную окружения) и повторите запрос.",
     };
   }
 
-  const partials = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const text = chunks[i];
-    const resp = await client.responses.create({
-      model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: "Суммируй текст кратко и строго по фактам. 3–6 буллетов, без воды." },
-        { role: "user", content: `Чанк ${i + 1}/${chunks.length}:\n\n${text}` },
-      ],
-    });
-    partials.push(resp.output_text?.trim() || "");
+  const modelChain = [getPreferredOpenAIModel(), "gpt-4o-mini", "gpt-4.1-mini"].filter(
+    (v, i, arr) => v && arr.indexOf(v) === i
+  );
+
+  function isRetriableError(e) {
+    const status = e?.status || e?.response?.status;
+    const code = e?.code || e?.cause?.code;
+    if ([408, 409, 429, 500, 502, 503, 504].includes(status)) return true;
+    if (["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH"].includes(code)) return true;
+    const msg = String(e?.message || "");
+    return msg.includes("ECONNRESET") || msg.includes("socket hang up") || msg.includes("network");
   }
 
-  const merged = partials.filter(Boolean).join("\n");
-  const final = await client.responses.create({
-    model: OPENAI_MODEL,
-    input: [
-      { role: "system", content: "Собери единый краткий пересказ. 8–14 буллетов. Без повторов. По сути." },
-      { role: "user", content: merged },
-    ],
-  });
+  async function createResponseWithRetry(model, input) {
+    const maxAttempts = 4;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await client.responses.create({ model, input });
+      } catch (e) {
+        lastError = e;
+        if (!isRetriableError(e) || attempt === maxAttempts) throw e;
+        const backoffMs = 500 * Math.pow(2, attempt - 1);
+        await sleep(backoffMs);
+      }
+    }
+    throw lastError || new Error("OpenAI request failed");
+  }
 
-  return { summary: final.output_text?.trim() || "" };
+  async function createResponseWithFallback(input) {
+    let lastError = null;
+    for (let i = 0; i < modelChain.length; i++) {
+      const model = modelChain[i];
+      try {
+        return await createResponseWithRetry(model, input);
+      } catch (e) {
+        lastError = e;
+        const status = e?.status || e?.response?.status;
+        const mayRetry = status === 403 || status === 404 || status === 429;
+        if (!mayRetry || i === modelChain.length - 1) {
+          throw e;
+        }
+      }
+    }
+    throw lastError || new Error("OpenAI request failed");
+  }
+
+  function buildLocalSummaryFromChunks(items) {
+    const all = items.join("\n").replace(/\s+/g, " ").trim();
+    const sentences = all
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 40);
+    const picked = sentences.slice(0, 12);
+    if (picked.length === 0) {
+      return "Локальный пересказ: не удалось выделить содержательные предложения из транскрипта.";
+    }
+    return picked.map((s) => `- ${s}`).join("\n");
+  }
+
+  const partials = [];
+  try {
+    for (let i = 0; i < chunks.length; i++) {
+      const text = chunks[i];
+      const resp = await createResponseWithFallback([
+        { role: "system", content: "Суммируй текст кратко и строго по фактам. 3-6 буллетов, без воды." },
+        { role: "user", content: `Чанк ${i + 1}/${chunks.length}:\n\n${text}` },
+      ]);
+      partials.push(resp.output_text?.trim() || "");
+    }
+
+    const merged = partials.filter(Boolean).join("\n");
+    const final = await createResponseWithFallback([
+      { role: "system", content: "Собери единый краткий пересказ. 8-14 буллетов. Без повторов. По сути." },
+      { role: "user", content: merged },
+    ]);
+
+    return { summary: final.output_text?.trim() || "" };
+  } catch (e) {
+    const status = e?.status || e?.response?.status;
+    const msg = String(e?.message || "");
+    const regionBlocked = status === 403 && msg.toLowerCase().includes("country, region, or territory not supported");
+    if (!regionBlocked) throw e;
+
+    return {
+      summary: buildLocalSummaryFromChunks(chunks),
+      warning:
+        "OpenAI недоступен для текущего региона (403). Показан локальный офлайн-пересказ из транскрипта.",
+    };
+  }
 }
+app.get("/api/env/status", (_req, res) => {
+  const openai = process.env.OPENAI_API_KEY || "";
+  const hf = process.env.HF_TOKEN || "";
+  res.json({
+    openai_api_key_set: Boolean(openai),
+    hf_token_set: Boolean(hf),
+  });
+});
+
+app.post("/api/env/set", (req, res) => {
+  const { openai_api_key, hf_token } = req.body || {};
+
+  const nextOpenAI = typeof openai_api_key === "string" ? openai_api_key.trim() : null;
+  const nextHF = typeof hf_token === "string" ? hf_token.trim() : null;
+
+  if (nextOpenAI !== null) {
+    if (!nextOpenAI) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = nextOpenAI;
+  }
+  if (nextHF !== null) {
+    if (!nextHF) delete process.env.HF_TOKEN;
+    else process.env.HF_TOKEN = nextHF;
+  }
+
+  res.json({
+    ok: true,
+    openai_api_key_set: Boolean(process.env.OPENAI_API_KEY),
+    hf_token_set: Boolean(process.env.HF_TOKEN),
+  });
+});
 
 app.post("/api/vk/summary", async (req, res) => {
   const { url, options } = req.body || {};
@@ -120,40 +230,68 @@ app.post("/api/vk/summary", async (req, res) => {
   let steps = -1;
   let log = "";
 
-  const mp4 = path.join(jobDir, "video.mp4");
-  const wav = path.join(jobDir, "audio.wav");
-  const txt = path.join(jobDir, "video.txt");
+  let wav = path.join(jobDir, "audio.wav");
+  const chunksDir = path.join(jobDir, "chunks");
+  const warnings = [];
 
   try {
-    // 1) download mp4
+    // 1) download audio (wav)
     steps = 0;
     const cookiesFile = process.env.COOKIES_FILE;
-    const cookieArgs = cookiesFile ? ["--cookies", cookiesFile] : ["--cookies-from-browser", "chrome"];
-    const dl = await run(YTDLP, [...cookieArgs, "-f", "bv*+ba/b", "-o", mp4, url], { cwd: jobDir });
+    const cookieArgs = cookiesFile ? ["--cookies", cookiesFile] : [];
+    const dl = await run(
+      YTDLP,
+      [
+        ...cookieArgs,
+        "-x",
+        "--audio-format",
+        "wav",
+        "--audio-quality",
+        "0",
+        "--postprocessor-args",
+        "ffmpeg:-ar 16000 -ac 1",
+        "-o",
+        wav,
+        url,
+      ],
+      { cwd: jobDir }
+    );
     if (wantLog) log += `# download\n${dl.out}\n${dl.err}\n`;
+    if (dl.err && !wantLog) warnings.push(`yt-dlp stderr:\n${dl.err.trim()}`);
+    if (!existsSync(wav)) {
+      const entries = await fs.readdir(jobDir);
+      const foundWav = entries.find((name) => name.toLowerCase().endsWith(".wav"));
+      if (foundWav) {
+        warnings.push(`audio.wav РЅРµ РЅР°Р№РґРµРЅ, РёСЃРїРѕР»СЊР·СѓСЋ ${foundWav} (СЃРєР°С‡Р°РЅ СЌС‚РѕС‚ С„Р°Р№Р»)`);
+        wav = path.join(jobDir, foundWav);
+      } else {
+        throw new Error("yt-dlp did not produce a .wav file. Check yt-dlp/ffmpeg output.");
+      }
+    }
 
-    // 2) ffmpeg -> wav
+    // 2) WhisperX -> txt
     steps = 1;
-    const ff = await run(FFMPEG, ["-i", mp4, "-vn", "-ar", "16000", "-ac", "1", wav], { cwd: jobDir });
-    if (wantLog) log += `# ffmpeg\n${ff.out}\n${ff.err}\n`;
-
-    // 3) WhisperX -> txt
-    steps = 2;
     const hfToken = process.env.HF_TOKEN;
     if (!hfToken) throw new Error("HF_TOKEN is not set");
-    const wx = await run(PYTHON, [WHISPERX_SCRIPT, wav, "--model", "large-v2", "--diarize", "--hf_token", hfToken, "--highlight_words", "True"], { cwd: process.cwd() });
+    const wx = await run(
+      PYTHON,
+      [WHISPERX_SCRIPT_PATH, wav, "--model", "large-v2", "--diarize", "--highlight_words", "True", "--output_dir", jobDir, "--output_format", "txt"],
+      { cwd: process.cwd() }
+    );
     if (wantLog) log += `# whisperx\n${wx.out}\n${wx.err}\n`;
 
-    const transcriptPath = process.env.TRANSCRIPT_PATH || txt;
+    const expectedTxt = path.join(jobDir, `${path.parse(wav).name}.txt`);
+    let transcriptPath = process.env.TRANSCRIPT_PATH || expectedTxt;
     if (!existsSync(transcriptPath)) {
       const entries = await fs.readdir(jobDir);
       const anyTxt = entries.find((n) => n.toLowerCase().endsWith(".txt"));
       if (!anyTxt) throw new Error("WhisperX output .txt not found. Set TRANSCRIPT_PATH or adjust run_whisperx.py output.");
+      transcriptPath = path.join(jobDir, anyTxt);
     }
 
-    // 4) split into chunks
-    steps = 3;
-    const splitArgs = [SPLIT_SCRIPT, transcriptPath];
+    // 3) split into chunks
+    steps = 2;
+    const splitArgs = [SPLIT_SCRIPT_PATH, transcriptPath, "-o", chunksDir];
     if (wordLimit) splitArgs.push("-w", String(wordLimit));
     if (!clean) splitArgs.push("--no-clean");
     if (!wantLog) splitArgs.push("--no-log");
@@ -172,13 +310,16 @@ app.post("/api/vk/summary", async (req, res) => {
       if (t.trim()) chunks.push(t);
     }
 
-    // 5) OpenAI summary
-    steps = 4;
-    const { summary } = await summarizeChunksWithOpenAI(chunks);
+    // 4) OpenAI summary
+    steps = 3;
+    const { summary, warning } = await summarizeChunksWithOpenAI(chunks);
+    if (warning) warnings.push(warning);
 
-    return res.json({ summary, log: wantLog ? log : "", steps });
+    return res.json({ summary, log: wantLog ? log : "", steps, warnings });
   } catch (e) {
-    return res.status(500).json({ error: e?.message || "Pipeline failed", log: wantLog ? log : "", steps });
+    return res
+      .status(500)
+      .json({ error: e?.message || "Pipeline failed", log: wantLog ? log : "", steps, warnings });
   }
 });
 
@@ -193,3 +334,5 @@ app.listen(PORT, async () => {
   await fs.mkdir(WORK_ROOT, { recursive: true });
   console.log(`Server: http://localhost:${PORT}`);
 });
+
+

@@ -15,7 +15,7 @@
 ### ENV
 - `HF_TOKEN`
 - `OPENAI_API_KEY`
-- опционально: `OPENAI_MODEL` (по умолчанию `gpt-5`), `COOKIES_FILE`, `WHISPERX_SCRIPT`, `SPLIT_SCRIPT`, `TRANSCRIPT_PATH`
+- опционально: `OPENAI_MODEL` (по умолчанию `gpt-5`), `WHISPERX_SCRIPT`, `SPLIT_SCRIPT`, `TRANSCRIPT_PATH`, `COOKIES_FILE` (только если нужен доступ через cookies к закрытым/ограниченным видео)
 
 ## Установка
 ```bash

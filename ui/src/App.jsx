@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { isValidVkMask } from "./vkUrlRules";
 
 /**
@@ -35,14 +35,34 @@ async function postJson(url, body, signal) {
 
   if (!res.ok) {
     const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.data = json;
+    throw err;
+  }
+  return json;
+}
+
+async function getJson(url, signal) {
+  const res = await fetch(url, { signal });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.data = json;
+    throw err;
   }
   return json;
 }
 
 const STEP_LABELS = [
-  "Скачивание видео (mp4)",
-  "Извлечение аудио (ffmpeg → wav)",
+  "Скачивание аудио (yt-dlp → wav)",
   "Транскрипция (WhisperX + diarization → txt)",
   "Разбиение на чанки (split_whisperx.py)",
   "Краткий пересказ (ChatGPT)",
@@ -64,11 +84,72 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [resultText, setResultText] = useState("");
   const [pipelineLog, setPipelineLog] = useState("");
+  const [warnings, setWarnings] = useState([]);
   const [stepIndex, setStepIndex] = useState(-1);
   const [abortCtrl, setAbortCtrl] = useState(null);
   const [error, setError] = useState("");
+  const [openAiKey, setOpenAiKey] = useState("");
+  const [hfToken, setHfToken] = useState("");
+  const [envStatus, setEnvStatus] = useState({ openai_api_key_set: false, hf_token_set: false });
+  const [envMsg, setEnvMsg] = useState("");
+  const [envBusy, setEnvBusy] = useState(false);
 
   const canRun = url.trim().length > 0 && mode === "summary" && isLinkValid;
+
+  useEffect(() => {
+    onCheckEnv().catch(() => {});
+  }, []);
+
+  async function onCheckEnv() {
+    setEnvBusy(true);
+    setEnvMsg("");
+    try {
+      const data = await getJson("/api/env/status");
+      setEnvStatus({
+        openai_api_key_set: Boolean(data?.openai_api_key_set),
+        hf_token_set: Boolean(data?.hf_token_set),
+      });
+      setEnvMsg("Проверка выполнена.");
+    } catch (e) {
+      setEnvMsg(e?.message || "Не удалось проверить переменные.");
+    } finally {
+      setEnvBusy(false);
+    }
+  }
+
+  async function onSetOpenAI() {
+    setEnvBusy(true);
+    setEnvMsg("");
+    try {
+      const data = await postJson("/api/env/set", { openai_api_key: openAiKey });
+      setEnvStatus({
+        openai_api_key_set: Boolean(data?.openai_api_key_set),
+        hf_token_set: Boolean(data?.hf_token_set),
+      });
+      setEnvMsg(data?.openai_api_key_set ? "OPENAI_API_KEY сохранен в серверном процессе." : "OPENAI_API_KEY очищен.");
+    } catch (e) {
+      setEnvMsg(e?.message || "Не удалось сохранить OPENAI_API_KEY.");
+    } finally {
+      setEnvBusy(false);
+    }
+  }
+
+  async function onSetHF() {
+    setEnvBusy(true);
+    setEnvMsg("");
+    try {
+      const data = await postJson("/api/env/set", { hf_token: hfToken });
+      setEnvStatus({
+        openai_api_key_set: Boolean(data?.openai_api_key_set),
+        hf_token_set: Boolean(data?.hf_token_set),
+      });
+      setEnvMsg(data?.hf_token_set ? "HF_TOKEN сохранен в серверном процессе." : "HF_TOKEN очищен.");
+    } catch (e) {
+      setEnvMsg(e?.message || "Не удалось сохранить HF_TOKEN.");
+    } finally {
+      setEnvBusy(false);
+    }
+  }
 
   function applyDefaultsOnToggle(nextUseDefaults) {
     setUseDefaults(nextUseDefaults);
@@ -84,6 +165,7 @@ export default function App() {
     setError("");
     setResultText("");
     setPipelineLog("");
+    setWarnings([]);
     setStepIndex(-1);
 
     const trimmed = url.trim();
@@ -139,6 +221,7 @@ export default function App() {
 
       setResultText(json?.summary || "");
       setPipelineLog(json?.log || "");
+      setWarnings(Array.isArray(json?.warnings) ? json.warnings : []);
 
       if (!json?.summary) {
         setError("Backend не вернул пересказ.");
@@ -147,6 +230,7 @@ export default function App() {
       if (e?.name === "AbortError") {
         setError("Операция отменена.");
       } else {
+        setWarnings(Array.isArray(e?.data?.warnings) ? e.data.warnings : []);
         setError(e?.message || "Не удалось выполнить пересказ.");
       }
     } finally {
@@ -215,6 +299,85 @@ export default function App() {
                 </button>
               </div>
               <p className="mt-2 text-sm text-neutral-600">Сейчас поддерживается только VK и только «краткий пересказ».</p>
+            </div>
+
+            <div className="rounded-2xl border border-neutral-200 p-4">
+              <div className="text-sm font-medium">Переменные окружения</div>
+              <div className="mt-1 text-xs text-neutral-600">
+                Значения задаются для текущего процесса сервера. После перезапуска задайте снова или вынесите в системные env.
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                <label className="text-sm font-medium">OPENAI_API_KEY</label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="password"
+                    value={openAiKey}
+                    onChange={(e) => setOpenAiKey(e.target.value)}
+                    placeholder="sk-..."
+                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                  />
+                  <button
+                    type="button"
+                    onClick={onCheckEnv}
+                    disabled={envBusy}
+                    className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
+                  >
+                    Проверить наличие
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onSetOpenAI}
+                    disabled={envBusy}
+                    className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+                  >
+                    Сохранить
+                  </button>
+                </div>
+                <div className="text-xs text-neutral-600">
+                  Статус:{" "}
+                  <span className={envStatus.openai_api_key_set ? "text-emerald-700 font-medium" : "text-red-700 font-medium"}>
+                    {envStatus.openai_api_key_set ? "задан" : "не задан"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                <label className="text-sm font-medium">HF_TOKEN</label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="password"
+                    value={hfToken}
+                    onChange={(e) => setHfToken(e.target.value)}
+                    placeholder="hf_..."
+                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                  />
+                  <button
+                    type="button"
+                    onClick={onCheckEnv}
+                    disabled={envBusy}
+                    className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
+                  >
+                    Проверить наличие
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onSetHF}
+                    disabled={envBusy}
+                    className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+                  >
+                    Сохранить
+                  </button>
+                </div>
+                <div className="text-xs text-neutral-600">
+                  Статус:{" "}
+                  <span className={envStatus.hf_token_set ? "text-emerald-700 font-medium" : "text-red-700 font-medium"}>
+                    {envStatus.hf_token_set ? "задан" : "не задан"}
+                  </span>
+                </div>
+              </div>
+
+              {envMsg && <div className="mt-3 text-xs text-neutral-700">{envMsg}</div>}
             </div>
 
             {mode === "summary" && (
@@ -289,6 +452,13 @@ export default function App() {
 
             {error && (
               <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div>
+            )}
+            {warnings.length > 0 && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                {warnings.map((w, i) => (
+                  <div key={`${w}-${i}`}>{w}</div>
+                ))}
+              </div>
             )}
 
             <div className="flex items-center gap-3">
