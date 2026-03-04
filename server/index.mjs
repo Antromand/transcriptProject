@@ -2,7 +2,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { isValidVkMask } from "../ui/src/vkUrlRules.js";
+import { isSupportedVideoUrl } from "../ui/src/vkUrlRules.js";
 import { AppConfig } from "../AppConfig.mjs";
 import { LLMService } from "./src/llm/LLMService.mjs";
 import { SummaryPipelineService } from "./src/pipeline/SummaryPipelineService.mjs";
@@ -22,6 +22,11 @@ const llmService = new LLMService({ env: process.env, fetchImpl: fetch });
 const pipelineService = new SummaryPipelineService({
   workRoot: config.workRoot,
   ytdlpBin: config.ytdlpBin,
+  ffmpegBin: config.ffmpegBin,
+  ytdlpJsRuntimes: config.ytdlpJsRuntimes,
+  ytdlpRemoteComponents: config.ytdlpRemoteComponents,
+  ytdlpYoutubeExtractorArgs: config.ytdlpYoutubeExtractorArgs,
+  ytdlpYoutubePoToken: config.ytdlpYoutubePoToken,
   pythonBin: config.pythonBin,
   whisperxScriptPath: config.whisperxScriptPath,
   splitScriptPath: config.splitScriptPath,
@@ -36,12 +41,13 @@ const auditLogger = new AuditLogger({
   keepLastRecords: config.auditLogKeepLast,
 });
 const summaryController = new SummaryController({
-  isValidVkMask,
+  isSupportedVideoUrl,
   llmService,
   pipelineService,
   jobStore,
   auditLogger,
   envService,
+  workResultsKeepLast: config.workResultsKeepLast,
 });
 
 app.get("/api/env/status", (_req, res) => {
@@ -60,6 +66,10 @@ app.post("/api/env/reset", async (_req, res) => {
 
 app.get("/api/vk/summary/status/:jobId", (req, res) => summaryController.getStatus(req, res));
 app.post("/api/vk/summary", (req, res) => summaryController.create(req, res));
+app.post("/api/vk/summary/cancel/:jobId", (req, res) => summaryController.cancel(req, res));
+app.get("/api/video/summary/status/:jobId", (req, res) => summaryController.getStatus(req, res));
+app.post("/api/video/summary", (req, res) => summaryController.create(req, res));
+app.post("/api/video/summary/cancel/:jobId", (req, res) => summaryController.cancel(req, res));
 app.post("/api/pipeline/summary", (req, res) => summaryController.createFromStart(req, res));
 
 if (existsSync(config.uiDist)) {

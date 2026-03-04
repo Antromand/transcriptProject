@@ -4,10 +4,10 @@ import fs from "node:fs/promises";
 const PIPELINE_STEP_NAMES = ["download_audio", "whisperx_transcription", "split_chunks", "llm_summary"];
 
 export class AuditLogger {
-  constructor({ workRoot, auditLogPath, keepLastRecords = 20 }) {
+  constructor({ workRoot, auditLogPath, keepLastRecords = 0 }) {
     this.workRoot = workRoot;
     this.auditLogPath = auditLogPath || path.join(workRoot, "audit", "audit-log.jsonl");
-    this.keepLastRecords = Number.isFinite(keepLastRecords) && keepLastRecords > 0 ? keepLastRecords : 20;
+    this.keepLastRecords = Number.isFinite(keepLastRecords) && keepLastRecords > 0 ? keepLastRecords : 0;
   }
 
   getMonthlyAuditLogPath(isoDate) {
@@ -38,7 +38,6 @@ export class AuditLogger {
         deepseek_api_key: job.tokensSnapshot?.deepseek_api_key || "",
         grok_api_key: job.tokensSnapshot?.grok_api_key || "",
         gemini_api_key: job.tokensSnapshot?.gemini_api_key || "",
-        yandexgpt_api_key: job.tokensSnapshot?.yandexgpt_api_key || "",
         hf_token: job.tokensSnapshot?.hf_token || "",
       },
       failed_step_index: failedStepIndex,

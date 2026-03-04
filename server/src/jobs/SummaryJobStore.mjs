@@ -30,7 +30,7 @@ export class SummaryJobStore {
       current_step_elapsed_ms: currentElapsed,
       log: job.wantLog ? job.log : "",
       summary: job.status === "done" ? job.summary : "",
-      error: job.status === "error" ? job.error : "",
+      error: job.status === "error" || job.status === "canceled" ? job.error : "",
     };
   }
 }

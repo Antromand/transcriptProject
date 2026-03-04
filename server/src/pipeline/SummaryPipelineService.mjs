@@ -2,16 +2,22 @@
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 
-function runCommand(cmd, args, { cwd } = {}) {
+function runCommand(cmd, args, { cwd, onSpawn } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { cwd });
+    if (typeof onSpawn === "function") onSpawn(p);
     let out = "";
     let err = "";
     p.stdout.on("data", (d) => (out += d.toString()));
     p.stderr.on("data", (d) => (err += d.toString()));
     p.on("close", (code) => {
+      if (typeof onSpawn === "function") onSpawn(null);
       if (code === 0) resolve({ out, err });
       else reject(new Error(`${cmd} ${args.join(" ")}\n${err || out}`));
+    });
+    p.on("error", (spawnError) => {
+      if (typeof onSpawn === "function") onSpawn(null);
+      reject(spawnError);
     });
   });
 }
@@ -20,6 +26,11 @@ export class SummaryPipelineService {
   constructor({
     workRoot,
     ytdlpBin,
+    ffmpegBin,
+    ytdlpJsRuntimes,
+    ytdlpRemoteComponents,
+    ytdlpYoutubeExtractorArgs,
+    ytdlpYoutubePoToken,
     pythonBin,
     whisperxScriptPath,
     splitScriptPath,
@@ -29,6 +40,11 @@ export class SummaryPipelineService {
   }) {
     this.workRoot = workRoot;
     this.ytdlpBin = ytdlpBin;
+    this.ffmpegBin = ffmpegBin || "ffmpeg";
+    this.ytdlpJsRuntimes = ytdlpJsRuntimes || "node deno";
+    this.ytdlpRemoteComponents = ytdlpRemoteComponents || "ejs:github";
+    this.ytdlpYoutubeExtractorArgs = ytdlpYoutubeExtractorArgs || "player_client=android,web";
+    this.ytdlpYoutubePoToken = ytdlpYoutubePoToken || "";
     this.pythonBin = pythonBin;
     this.whisperxScriptPath = whisperxScriptPath;
     this.splitScriptPath = splitScriptPath;
@@ -83,7 +99,19 @@ export class SummaryPipelineService {
   }
 
   // Запускает end-to-end конвейер и заполняет объект job по ходу выполнения.
-  async run({ url, providerId, summaryFormat, wantLog, clean, wordLimit, job, startFromStep = 1, seededInputs = {} }) {
+  async run({
+    url,
+    localVideoPath = "",
+    providerId,
+    summaryFormat,
+    wantLog,
+    diagnosticsMode = false,
+    clean,
+    wordLimit,
+    job,
+    startFromStep = 1,
+    seededInputs = {},
+  }) {
     const jobDir = path.join(this.workRoot, job.id);
     await fs.mkdir(jobDir, { recursive: true });
 
@@ -104,13 +132,28 @@ export class SummaryPipelineService {
       job.currentStepStartedAt = null;
     };
 
+    this.throwIfCanceled(job);
+
     if (normalizedStart <= 1) {
       startStep(0);
-      const cookiesFile = this.env.COOKIES_FILE;
-      const cookieArgs = cookiesFile ? ["--cookies", cookiesFile] : [];
-      const dl = await runCommand(
-        this.ytdlpBin,
-        [
+      const sourceLocalPath = String(localVideoPath || "").trim();
+      const isLocalInput = Boolean(sourceLocalPath);
+      const isYoutube = this.isYoutubeUrl(url);
+      let dl;
+      if (isLocalInput) {
+        if (!this.existsSync(sourceLocalPath)) {
+          throw new Error(`Локальный файл не найден: ${sourceLocalPath}`);
+        }
+        dl = await this.runTrackedCommand(
+          job,
+          this.ffmpegBin,
+          ["-y", "-i", sourceLocalPath, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav],
+          { cwd: jobDir }
+        );
+      } else {
+        const cookiesFile = this.env.COOKIES_FILE;
+        const cookieArgs = cookiesFile ? ["--cookies", cookiesFile] : [];
+        const ytdlpArgs = [
           ...cookieArgs,
           "-x",
           "--audio-format",
@@ -121,13 +164,55 @@ export class SummaryPipelineService {
           "ffmpeg:-ar 16000 -ac 1",
           "-o",
           wav,
-          url,
-        ],
-        { cwd: jobDir }
-      );
+        ];
+        if (isYoutube && this.ytdlpJsRuntimes) {
+          const jsRuntimeArgs = this.buildJsRuntimeArgs();
+          if (jsRuntimeArgs.length > 0) ytdlpArgs.push(...jsRuntimeArgs);
+        }
+        if (isYoutube && this.ytdlpRemoteComponents) {
+          const remoteComponentArgs = this.buildRemoteComponentArgs();
+          if (remoteComponentArgs.length > 0) ytdlpArgs.push(...remoteComponentArgs);
+        }
+        if (isYoutube && this.ytdlpYoutubeExtractorArgs) {
+          ytdlpArgs.push("--extractor-args", `youtube:${this.ytdlpYoutubeExtractorArgs}`);
+        }
+        if (isYoutube && this.ytdlpYoutubePoToken) {
+          const poToken = this.normalizeYoutubePoToken(this.ytdlpYoutubePoToken);
+          if (poToken) ytdlpArgs.push("--extractor-args", `youtube:po_token=${poToken}`);
+        }
+        ytdlpArgs.push(url);
+
+        try {
+          dl = await this.runTrackedCommand(job, this.ytdlpBin, ytdlpArgs, { cwd: jobDir });
+        } catch (error) {
+          this.throwIfCanceled(job);
+          const msg = String(error?.message || "");
+          // Older yt-dlp builds may not have --js-runtimes.
+          if (isYoutube && msg.includes("--js-runtimes")) {
+            const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--js-runtimes" || ytdlpArgs[idx - 1] === "--js-runtimes"));
+            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir });
+            job.warnings.push("yt-dlp не поддерживает --js-runtimes, выполнен повторный запуск без этого флага.");
+          } else if (isYoutube && msg.includes("--remote-components")) {
+            const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--remote-components" || ytdlpArgs[idx - 1] === "--remote-components"));
+            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir });
+            job.warnings.push("yt-dlp не поддерживает --remote-components, выполнен повторный запуск без этого флага.");
+          } else {
+            throw error;
+          }
+        }
+      }
+      this.throwIfCanceled(job);
       finishStep(0);
       if (wantLog) job.log += `# download\n${dl.out}\n${dl.err}\n`;
-      if (dl.err && !wantLog) job.warnings.push(`yt-dlp stderr:\n${dl.err.trim()}`);
+      if (dl.err && !wantLog) {
+        const cleanedErr = this.cleanStep1Warnings({
+          stderrText: dl.err,
+          isYoutube,
+          isLocalInput,
+          diagnosticsMode,
+        });
+        if (cleanedErr.trim()) job.warnings.push(`yt-dlp stderr:\n${cleanedErr.trim()}`);
+      }
       if (!this.existsSync(wav)) {
         const entries = await fs.readdir(jobDir);
         const foundWav = entries.find((name) => name.toLowerCase().endsWith(".wav"));
@@ -145,14 +230,17 @@ export class SummaryPipelineService {
     }
 
     if (normalizedStart <= 2) {
+      this.throwIfCanceled(job);
       startStep(1);
       const hfToken = this.env.HF_TOKEN;
       if (!hfToken) throw new Error("HF_TOKEN is not set");
-      const wx = await runCommand(
+      const wx = await this.runTrackedCommand(
+        job,
         this.pythonBin,
         [this.whisperxScriptPath, wav, "--model", "large-v2", "--diarize", "--highlight_words", "True", "--output_dir", jobDir, "--output_format", "txt"],
         { cwd: process.cwd() }
       );
+      this.throwIfCanceled(job);
       finishStep(1);
       if (wantLog) job.log += `# whisperx\n${wx.out}\n${wx.err}\n`;
 
@@ -181,12 +269,14 @@ export class SummaryPipelineService {
     }
 
     if (normalizedStart <= 3) {
+      this.throwIfCanceled(job);
       startStep(2);
       const splitArgs = [this.splitScriptPath, transcriptPath, "-o", chunksDir];
       if (wordLimit) splitArgs.push("-w", String(wordLimit));
       if (!clean) splitArgs.push("--no-clean");
       if (!wantLog) splitArgs.push("--no-log");
-      const sp = await runCommand(this.pythonBin, splitArgs, { cwd: process.cwd() });
+      const sp = await this.runTrackedCommand(job, this.pythonBin, splitArgs, { cwd: process.cwd() });
+      this.throwIfCanceled(job);
       finishStep(2);
       if (wantLog) job.log += `# split\n${sp.out}\n${sp.err}\n`;
 
@@ -196,11 +286,128 @@ export class SummaryPipelineService {
       }
     }
 
+    this.throwIfCanceled(job);
     startStep(3);
     const { summary, warning } = await this.llmService.summarizeChunks(chunks, { providerId, summaryFormat, sourceUrl: url });
+    this.throwIfCanceled(job);
     finishStep(3);
     if (warning) job.warnings.push(warning);
     if (wantLog) job.log += `# llm provider: ${providerId}\n`;
     return { summary };
+  }
+
+  isYoutubeUrl(rawUrl) {
+    try {
+      const host = new URL(String(rawUrl || "")).hostname.toLowerCase();
+      return host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be" || host.endsWith(".youtu.be");
+    } catch {
+      return false;
+    }
+  }
+
+  buildJsRuntimeArgs() {
+    const raw = String(this.ytdlpJsRuntimes || "").trim();
+    if (!raw) return [];
+
+    const tokens = raw
+      .split(/[,\s;|]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+    const normalized = [];
+    for (const token of tokens) {
+      const lower = token.toLowerCase();
+      if (lower === "node" || lower === "nodejs") {
+        const nodePath = process.execPath || "";
+        if (nodePath && /node(\.exe)?$/i.test(path.basename(nodePath))) {
+          normalized.push(`node:${nodePath}`);
+        } else {
+          normalized.push("node");
+        }
+        continue;
+      }
+      normalized.push(token);
+    }
+
+    const unique = normalized.filter((v, i, arr) => arr.indexOf(v) === i);
+    const args = [];
+    for (const rt of unique) {
+      args.push("--js-runtimes", rt);
+    }
+    return args;
+  }
+
+  buildRemoteComponentArgs() {
+    const raw = String(this.ytdlpRemoteComponents || "").trim();
+    if (!raw) return [];
+    const tokens = raw
+      .split(/[,\s;|]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+    const unique = tokens.filter((v, i, arr) => arr.indexOf(v) === i);
+    const args = [];
+    for (const component of unique) {
+      args.push("--remote-components", component);
+    }
+    return args;
+  }
+
+  cleanYoutubeNonFatalWarnings(stderrText) {
+    const text = String(stderrText || "");
+    if (!text.trim()) return "";
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const filtered = lines.filter((line) => {
+      const lower = line.toLowerCase();
+      if (!lower.includes("warning: [youtube]")) return true;
+      if (lower.includes("[jsc]")) return false;
+      if (lower.includes("n challenge solving failed")) return false;
+      if (lower.includes("remote component challenge solver script")) return false;
+      if (lower.includes("some formats may be missing")) return false;
+      if (lower.includes("android client https formats require a gvs po token")) return false;
+      if (lower.includes("you can manually pass a gvs po token")) return false;
+      return true;
+    });
+    return filtered.join("\n");
+  }
+
+  cleanStep1Warnings({ stderrText, isYoutube, isLocalInput, diagnosticsMode }) {
+    const text = String(stderrText || "");
+    if (!text.trim()) return "";
+
+    // ffmpeg writes technical progress/details into stderr even on success.
+    // Hide this noise for local-file mode unless diagnostics is enabled.
+    if (isLocalInput && !diagnosticsMode) return "";
+
+    if (isYoutube && !diagnosticsMode) {
+      return this.cleanYoutubeNonFatalWarnings(text);
+    }
+
+    return text;
+  }
+
+  normalizeYoutubePoToken(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    if (raw.includes("android.gvs+")) return raw;
+    return `android.gvs+${raw}`;
+  }
+
+  async runTrackedCommand(job, cmd, args, options = {}) {
+    return runCommand(cmd, args, {
+      ...options,
+      onSpawn: (proc) => {
+        job.currentProcess = proc;
+      },
+    });
+  }
+
+  throwIfCanceled(job) {
+    if (!job?.cancelRequested) return;
+    const error = new Error("Job canceled by user");
+    error.code = "JOB_CANCELED";
+    throw error;
   }
 }

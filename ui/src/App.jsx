@@ -1,8 +1,8 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from "react";
-import { isValidVkMask } from "./vkUrlRules";
+import { isSupportedVideoUrl } from "./vkUrlRules";
 
 /**
- * MVP (VK-only)
+ * MVP (VK/YouTube/Twitch)
  * UI вызывает backend endpoint, который выполняет пайплайн:
  * 1) download mp4
  * 2) ffmpeg -> wav
@@ -80,13 +80,13 @@ function delay(ms, signal) {
 }
 
 const BASE_STEP_LABELS = [
-  "Скачивание аудио (yt-dlp > wav)",
+  "Подготовка аудио (ссылка через yt-dlp или локальный файл через ffmpeg > wav)",
   "Транскрипция (WhisperX + diarization > txt)",
   "Разбиение на чанки (split_whisperx.py)",
 ];
 
 const START_STEP_INPUT_LABELS = {
-  1: "Ссылка на видео",
+  1: "Источник видео",
   2: ".wav файл",
   3: ".txt файл транскрипта",
   4: ".txt файл для пересказа",
@@ -136,15 +136,6 @@ const LLM_OPTIONS = [
     keyUrl: "https://aistudio.google.com/app/apikey",
     keyHelp: "Получить API-ключ: Google AI Studio -> API keys.",
   },
-  {
-    id: "yandexgpt",
-    label: "YandexGPT",
-    keyName: "YANDEXGPT_API_KEY",
-    keyStatusField: "yandexgpt_api_key_set",
-    placeholder: "AQVN...",
-    keyUrl: "https://oauth.yandex.ru/",
-    keyHelp: "Для 300.ya.ru используйте OAuth-токен Яндекса (формат AQVN...).",
-  },
 ];
 
 const SUMMARY_FORMAT_OPTIONS = [
@@ -152,6 +143,13 @@ const SUMMARY_FORMAT_OPTIONS = [
   { id: "medium", label: "Средний" },
   { id: "detailed", label: "Подробный" },
 ];
+const SUMMARY_FORMAT_STORAGE_KEY = "summary_format";
+const DIAGNOSTICS_MODE_STORAGE_KEY = "diagnostics_mode";
+
+function normalizeSummaryFormat(value) {
+  const id = String(value || "").trim().toLowerCase();
+  return SUMMARY_FORMAT_OPTIONS.some((opt) => opt.id === id) ? id : "short";
+}
 
 function getSummaryFormatLabel(summaryFormat) {
   return SUMMARY_FORMAT_OPTIONS.find((f) => f.id === summaryFormat)?.label || "Краткий";
@@ -190,7 +188,9 @@ function buildStepLabels(providerId, summaryFormat) {
 
 export default function App() {
   const [url, setUrl] = useState("");
-  const isLinkValid = useMemo(() => url.trim().length > 0 && isValidVkMask(url), [url]);
+  const isLinkValid = useMemo(() => url.trim().length > 0 && isSupportedVideoUrl(url), [url]);
+  const [sourceType, setSourceType] = useState("url");
+  const [localVideoFile, setLocalVideoFile] = useState(null);
   const [startStep, setStartStep] = useState(1);
   const [audioFile, setAudioFile] = useState(null);
   const [transcriptFile, setTranscriptFile] = useState(null);
@@ -199,13 +199,26 @@ export default function App() {
   const mode = "summary";
   const [activeTab, setActiveTab] = useState("run");
   const [llmProvider, setLlmProvider] = useState("deepseek");
-  const [summaryFormat, setSummaryFormat] = useState("short");
+  const [summaryFormat, setSummaryFormat] = useState(() => {
+    try {
+      return normalizeSummaryFormat(window.localStorage.getItem(SUMMARY_FORMAT_STORAGE_KEY));
+    } catch {
+      return "short";
+    }
+  });
 
   // Опции пересказа
   const [wordLimitEnabled, setWordLimitEnabled] = useState(false);
   const [wordLimit, setWordLimit] = useState("20000");
   const [cleanFiller, setCleanFiller] = useState(true);
   const [showLog, setShowLog] = useState(false);
+  const [diagnosticsMode, setDiagnosticsMode] = useState(() => {
+    try {
+      return window.localStorage.getItem(DIAGNOSTICS_MODE_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const [isRunning, setIsRunning] = useState(false);
   const [resultText, setResultText] = useState("");
@@ -216,13 +229,13 @@ export default function App() {
   const [activeStepStartedAt, setActiveStepStartedAt] = useState(null);
   const [activeStepElapsedMs, setActiveStepElapsedMs] = useState(0);
   const [abortCtrl, setAbortCtrl] = useState(null);
+  const [currentJobId, setCurrentJobId] = useState("");
   const [error, setError] = useState("");
   const [llmKeys, setLlmKeys] = useState({
     openai: "",
     deepseek: "",
     grok: "",
     gemini: "",
-    yandexgpt: "",
   });
   const [hfToken, setHfToken] = useState("");
   const [envStatus, setEnvStatus] = useState({
@@ -230,7 +243,6 @@ export default function App() {
     deepseek_api_key_set: false,
     grok_api_key_set: false,
     gemini_api_key_set: false,
-    yandexgpt_api_key_set: false,
     hf_token_set: false,
   });
   const [toasts, setToasts] = useState([]);
@@ -265,15 +277,19 @@ export default function App() {
   function getInputErrorByStep(step) {
     const trimmed = url.trim();
     if (step === 1) {
-      if (!trimmed) return "Введите ссылку на VK видео.";
+      if (sourceType === "local_file") {
+        if (!localVideoFile) return "Выберите локальный видеофайл.";
+        return "";
+      }
+      if (!trimmed) return "Введите ссылку на видео (VK, YouTube или Twitch).";
       try {
         // eslint-disable-next-line no-new
         new URL(trimmed);
       } catch {
-        return "Ссылка выглядит некорректно. Пример: https://vk.com/... или https://vkvideo.ru/video-...";
+        return "Ссылка выглядит некорректно. Пример: https://youtu.be/... или https://www.twitch.tv/videos/...";
       }
-      if (!isValidVkMask(trimmed)) {
-        return "Ссылка не подходит под маску VK.";
+      if (!isSupportedVideoUrl(trimmed)) {
+        return "Поддерживаются ссылки VK, YouTube и Twitch.";
       }
       return "";
     }
@@ -321,6 +337,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(SUMMARY_FORMAT_STORAGE_KEY, normalizeSummaryFormat(summaryFormat));
+    } catch {
+      // ignore storage errors
+    }
+  }, [summaryFormat]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DIAGNOSTICS_MODE_STORAGE_KEY, diagnosticsMode ? "1" : "0");
+    } catch {
+      // ignore storage errors
+    }
+  }, [diagnosticsMode]);
+
+  useEffect(() => {
     if (!isRunning || activeStepStartedAt === null) return undefined;
     const timer = setInterval(() => {
       setActiveStepElapsedMs(Date.now() - activeStepStartedAt);
@@ -357,7 +389,6 @@ export default function App() {
       deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
       grok_api_key_set: Boolean(data?.grok_api_key_set),
       gemini_api_key_set: Boolean(data?.gemini_api_key_set),
-      yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
       hf_token_set: Boolean(data?.hf_token_set),
     };
     setEnvStatus(nextStatus);
@@ -397,7 +428,6 @@ export default function App() {
         deepseek: "deepseek_api_key",
         grok: "grok_api_key",
         gemini: "gemini_api_key",
-        yandexgpt: "yandexgpt_api_key",
       };
       const field = keyFieldByProvider[llmProvider] || "openai_api_key";
       const keyValue = llmKeys[llmProvider] || "";
@@ -407,7 +437,6 @@ export default function App() {
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
         gemini_api_key_set: Boolean(data?.gemini_api_key_set),
-        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
       const isSet = Boolean(data?.[selectedProvider.keyStatusField]);
@@ -431,7 +460,6 @@ export default function App() {
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
         gemini_api_key_set: Boolean(data?.gemini_api_key_set),
-        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
       pushToast(data?.hf_token_set ? "HF_TOKEN сохранен в серверном процессе." : "HF_TOKEN очищен.", "success");
@@ -454,7 +482,6 @@ export default function App() {
         deepseek: "deepseek_api_key",
         grok: "grok_api_key",
         gemini: "gemini_api_key",
-        yandexgpt: "yandexgpt_api_key",
       };
       const field = keyFieldByProvider[llmProvider] || "openai_api_key";
       const data = await postJson("/api/env/set", { [field]: "" });
@@ -463,7 +490,6 @@ export default function App() {
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
         gemini_api_key_set: Boolean(data?.gemini_api_key_set),
-        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
       pushToast(`${selectedProvider.keyName} очищен.`, "success");
@@ -484,7 +510,6 @@ export default function App() {
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
         gemini_api_key_set: Boolean(data?.gemini_api_key_set),
-        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
       pushToast("HF_TOKEN очищен.", "success");
@@ -504,6 +529,7 @@ export default function App() {
     setStepDurationsMs([]);
     setActiveStepStartedAt(null);
     setActiveStepElapsedMs(0);
+    setCurrentJobId("");
 
     const resolvedStep = Math.max(1, Math.min(4, Number(forcedStep) || 1));
     setStartStep(resolvedStep);
@@ -521,26 +547,33 @@ export default function App() {
 
     const trimmed = url.trim();
     if (resolvedStep === 1) {
-      if (!trimmed) {
-        setError("Введите ссылку на VK видео.");
-        return;
-      }
+      if (sourceType === "local_file") {
+        if (!localVideoFile) {
+          setError("Выберите локальный видеофайл.");
+          return;
+        }
+      } else {
+        if (!trimmed) {
+          setError("Введите ссылку на видео (VK, YouTube или Twitch).");
+          return;
+        }
 
-      try {
-        // eslint-disable-next-line no-new
-        new URL(trimmed);
-      } catch {
-        setError(
-          "Ссылка выглядит некорректно. Примеры: https://vk.com/abc?z=video-123456 или https://vkvideo.ru/video-123456"
-        );
-        return;
-      }
+        try {
+          // eslint-disable-next-line no-new
+          new URL(trimmed);
+        } catch {
+          setError(
+            "Ссылка выглядит некорректно. Примеры: https://youtu.be/dQw4w9WgXcQ или https://www.twitch.tv/videos/123456789"
+          );
+          return;
+        }
 
-      if (!isValidVkMask(trimmed)) {
-        setError(
-          "Ссылка не подходит под маску. Нужны форматы: https://vk.com/{sometext}?z=video-{number} или https://vkvideo.ru/video-{number}"
-        );
-        return;
+        if (!isSupportedVideoUrl(trimmed)) {
+          setError(
+            "Ссылка не поддерживается. Подходят форматы VK, YouTube (watch/shorts/youtu.be) и Twitch (videos/clips)."
+          );
+          return;
+        }
       }
     }
 
@@ -558,19 +591,28 @@ export default function App() {
         word_limit: wl, // null => default
         clean: cleanFiller,
         log: showLog,
+        diagnostics: diagnosticsMode,
         async: true,
       };
 
       let startJson = null;
       if (resolvedStep === 1) {
-        startJson = await postJson(
-          "/api/vk/summary",
-          {
-            url: trimmed,
-            options: commonOptions,
-          },
-          ctrl.signal
-        );
+        if (sourceType === "local_file") {
+          const formData = new FormData();
+          formData.append("start_step", "1");
+          formData.append("options", JSON.stringify(commonOptions));
+          formData.append("input_file", localVideoFile);
+          startJson = await postFormData("/api/pipeline/summary", formData, ctrl.signal);
+        } else {
+          startJson = await postJson(
+            "/api/video/summary",
+            {
+              url: trimmed,
+              options: commonOptions,
+            },
+            ctrl.signal
+          );
+        }
       } else {
         const inputFile = resolvedStep === 2 ? audioFile : resolvedStep === 3 ? transcriptFile : summarySourceFile;
         const formData = new FormData();
@@ -582,9 +624,10 @@ export default function App() {
       }
 
       if (startJson?.job_id) {
+        setCurrentJobId(startJson.job_id);
         while (true) {
           await delay(700, ctrl.signal);
-          const statusJson = await getJson(`/api/vk/summary/status/${startJson.job_id}`, ctrl.signal);
+          const statusJson = await getJson(`/api/video/summary/status/${startJson.job_id}`, ctrl.signal);
 
           if (typeof statusJson?.steps === "number") setStepIndex(Math.min(stepLabels.length - 1, statusJson.steps));
           setWarnings(Array.isArray(statusJson?.warnings) ? statusJson.warnings : []);
@@ -595,13 +638,22 @@ export default function App() {
             setStepIndex(stepLabels.length);
             setActiveStepStartedAt(null);
             setResultText(statusJson?.summary || "");
+            setCurrentJobId("");
             if (!statusJson?.summary) setError("Backend не вернул пересказ.");
             setTimeout(() => scrollToResultSmooth(), 0);
             break;
           }
           if (statusJson?.status === "error") {
             setActiveStepStartedAt(null);
+            setCurrentJobId("");
             setError(statusJson?.error || "Не удалось выполнить пересказ.");
+            setTimeout(() => scrollToResultSmooth(), 0);
+            break;
+          }
+          if (statusJson?.status === "canceled") {
+            setActiveStepStartedAt(null);
+            setCurrentJobId("");
+            setError(statusJson?.error || "Остановлено пользователем.");
             setTimeout(() => scrollToResultSmooth(), 0);
             break;
           }
@@ -632,6 +684,17 @@ export default function App() {
       setIsRunning(false);
       setActiveStepStartedAt(null);
       setAbortCtrl(null);
+    }
+  }
+
+  async function onStopProcess() {
+    if (!isRunning || !currentJobId) return;
+    const ok = window.confirm("Остановить текущий процесс?");
+    if (!ok) return;
+    try {
+      await postJson(`/api/video/summary/cancel/${currentJobId}`, {});
+    } catch {
+      // ignore transient cancel API errors; polling will reflect actual state
     }
   }
 
@@ -668,6 +731,15 @@ export default function App() {
             >
               Настройки
             </button>
+            {isRunning && (
+              <button
+                type="button"
+                onClick={onStopProcess}
+                className="rounded-xl bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
+              >
+                Остановить
+              </button>
+            )}
           </div>
           <div className="grid gap-4">
 
@@ -729,24 +801,67 @@ export default function App() {
                         <div className="overflow-hidden">
                           <label className="mt-3 block text-xs font-medium text-neutral-600">{START_STEP_INPUT_LABELS[step]}</label>
                           {step === 1 && (
-                            <div className="mt-2 flex gap-2">
-                              <input
-                                value={url}
-                                onChange={(e) => setUrl(e.target.value)}
-                                disabled={isRunning}
-                                placeholder="https://vk.com/... или https://vkvideo.ru/video-..."
-                                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
-                              />
-                              <div className="shrink-0 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
-                                <span className="text-neutral-500">Ссылка:</span>{" "}
-                                <span
-                                  className={`font-medium ${
-                                    !url.trim() ? "text-neutral-400" : isLinkValid ? "text-emerald-600" : "text-red-600"
+                            <div className="mt-2 grid gap-2">
+                              <div className="grid grid-cols-2 gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setSourceType("url")}
+                                  disabled={isRunning}
+                                  className={`rounded-xl px-3 py-2 text-sm ring-1 ${
+                                    sourceType === "url"
+                                      ? "bg-neutral-900 text-white ring-neutral-900"
+                                      : "bg-white text-neutral-900 ring-neutral-200"
                                   }`}
                                 >
-                                  {!url.trim() ? "—" : isLinkValid ? "верная" : "не подходит"}
-                                </span>
+                                  По ссылке
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setSourceType("local_file")}
+                                  disabled={isRunning}
+                                  className={`rounded-xl px-3 py-2 text-sm ring-1 ${
+                                    sourceType === "local_file"
+                                      ? "bg-neutral-900 text-white ring-neutral-900"
+                                      : "bg-white text-neutral-900 ring-neutral-200"
+                                  }`}
+                                >
+                                  Локальный файл
+                                </button>
                               </div>
+
+                              {sourceType === "url" ? (
+                                <div className="flex gap-2">
+                                  <input
+                                    value={url}
+                                    onChange={(e) => setUrl(e.target.value)}
+                                    disabled={isRunning}
+                                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                                  />
+                                  <div className="shrink-0 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                                    <span className="text-neutral-500">Ссылка:</span>{" "}
+                                    <span
+                                      className={`font-medium ${
+                                        !url.trim() ? "text-neutral-400" : isLinkValid ? "text-emerald-600" : "text-red-600"
+                                      }`}
+                                    >
+                                      {!url.trim() ? "—" : isLinkValid ? "верная" : "не подходит"}
+                                    </span>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mt-1">
+                                  <input
+                                    type="file"
+                                    accept="video/*,.mp4,.mkv,.mov,.avi,.webm,.m4v"
+                                    disabled={isRunning}
+                                    onChange={(e) => setLocalVideoFile(e.target.files?.[0] || null)}
+                                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-900 file:px-3 file:py-1 file:text-xs file:text-white"
+                                  />
+                                  <div className="mt-1 text-xs text-neutral-500">
+                                    {localVideoFile ? localVideoFile.name : "Файл не выбран"}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           )}
 
@@ -1044,6 +1159,16 @@ export default function App() {
                       className="h-4 w-4"
                     />
                   </label>
+
+                  <label className="flex items-center justify-between gap-3 text-sm">
+                    <span>Диагностический режим (подробные warning)</span>
+                    <input
+                      type="checkbox"
+                      checked={diagnosticsMode}
+                      onChange={(e) => setDiagnosticsMode(e.target.checked)}
+                      className="h-4 w-4"
+                    />
+                  </label>
                 </div>
               </div>
             )}
@@ -1111,7 +1236,7 @@ export default function App() {
         </footer>
       </div>
 
-      <div className="fixed bottom-4 right-4 z-50 flex w-96 max-w-full flex-col gap-2">
+      <div className="fixed top-4 right-4 z-50 flex w-96 max-w-full flex-col gap-2">
         {toasts.map((t) => (
           <div
             key={t.id}

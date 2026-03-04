@@ -32,12 +32,6 @@ export const LLM_PROVIDERS = {
     defaultModel: "gemini-2.0-flash",
     fallbackModels: ["gemini-2.0-flash"],
   },
-  yandexgpt: {
-    apiKeyEnv: "YANDEXGPT_API_KEY",
-    modelEnv: "YANDEXGPT_MODEL",
-    defaultModel: "300ya-sharing-url",
-    fallbackModels: ["300ya-sharing-url"],
-  },
 };
 
 const SUMMARY_FORMATS = {
@@ -46,9 +40,7 @@ const SUMMARY_FORMATS = {
       "Сделай сжатый пересказ чанка по фактам, без воды и повторов.",
     finalSystem:
       "Собери единый пересказ по всем чанкам. Структурируй по смысловым блокам с короткими заголовками, без буллетов и без повторов.",
-    targetWords: 1000,
-    minWords: 850,
-    maxWords: 1150,
+    ratio: 0.02,
     localSentences: 12,
   },
   medium: {
@@ -56,9 +48,7 @@ const SUMMARY_FORMATS = {
       "Сделай структурированный пересказ чанка по фактам, с ключевыми деталями и контекстом.",
     finalSystem:
       "Собери единый пересказ по всем чанкам. Структурируй по смысловым блокам с короткими заголовками, без буллетов, с ключевыми деталями и причинно-следственными связями.",
-    targetWords: 2500,
-    minWords: 2100,
-    maxWords: 2900,
+    ratio: 0.05,
     localSentences: 20,
   },
   detailed: {
@@ -66,9 +56,7 @@ const SUMMARY_FORMATS = {
       "Сделай подробный пересказ чанка по фактам: важные детали, цифры, имена, термины, позиции говорящих.",
     finalSystem:
       "Собери единый подробный пересказ по всем чанкам. Раздели по смысловым блокам с короткими заголовками, без буллетов, сохрани важные детали и убери повторы.",
-    targetWords: 6000,
-    minWords: 5200,
-    maxWords: 6800,
+    ratio: 0.1,
     localSentences: 32,
   },
 };
@@ -111,12 +99,13 @@ function countWords(text) {
   return (text.trim().match(/\S+/g) || []).length;
 }
 
-function getChunkWordRange(formatCfg, chunksCount) {
-  const safeChunksCount = Math.max(1, Number(chunksCount) || 1);
-  const perChunkTarget = Math.max(120, Math.round(formatCfg.targetWords / safeChunksCount));
-  const minWords = Math.max(100, Math.round(perChunkTarget * 0.75));
-  const maxWords = Math.max(minWords + 60, Math.round(perChunkTarget * 1.2));
-  return { perChunkTarget, minWords, maxWords };
+function getTargetRangeBySourceWords(sourceWords, ratio) {
+  const safeSourceWords = Math.max(1, Number(sourceWords) || 1);
+  const safeRatio = Math.max(0.001, Number(ratio) || 0.02);
+  const targetWords = Math.max(1, Math.round(safeSourceWords * safeRatio));
+  const minWords = Math.max(1, Math.round(targetWords * 0.8));
+  const maxWords = Math.max(minWords, Math.round(targetWords * 1.2));
+  return { targetWords, minWords, maxWords };
 }
 
 export class LLMService {
@@ -142,8 +131,6 @@ export class LLMService {
   }
 
   getProviderClient(providerId) {
-    // Yandex 300 работает через отдельный REST API, не через OpenAI-совместимый SDK.
-    if (providerId === "yandexgpt") return null;
     const cfg = this.getProviderConfig(providerId);
     const key = this.env[cfg.apiKeyEnv];
     if (!key) return null;
@@ -168,8 +155,7 @@ export class LLMService {
     const normalizedFormat = this.normalizeSummaryFormat(summaryFormat);
     const formatCfg = SUMMARY_FORMATS[normalizedFormat];
     const client = this.getProviderClient(providerId);
-    if (providerId !== "yandexgpt" && !client) return { summary: this.getMissingKeyMessage(providerId) };
-    if (providerId === "yandexgpt" && !this.env.YANDEXGPT_API_KEY) return { summary: this.getMissingKeyMessage(providerId) };
+    if (!client) return { summary: this.getMissingKeyMessage(providerId) };
 
     const modelChain = this.getModelChain(providerId);
 
@@ -187,31 +173,6 @@ export class LLMService {
       let lastError = null;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-          if (providerId === "yandexgpt") {
-            if (!sourceUrl) throw new Error("Для YandexGPT (300.ya.ru) требуется исходный URL.");
-            const endpoint = this.env.YANDEX300_ENDPOINT || "https://300.ya.ru/api/sharing-url";
-            const r = await this.fetchImpl(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `OAuth ${this.env.YANDEXGPT_API_KEY}`,
-              },
-              body: JSON.stringify({ article_url: sourceUrl }),
-            });
-            const payload = await r.json().catch(() => ({}));
-            if (!r.ok) {
-              const err = new Error(payload?.message || payload?.error || `Yandex 300 HTTP ${r.status}`);
-              err.status = r.status;
-              throw err;
-            }
-            if (payload?.status !== "success" || !payload?.sharing_url) {
-              const err = new Error("Yandex 300 вернул неожиданный формат ответа.");
-              err.status = 500;
-              throw err;
-            }
-            return payload;
-          }
-
           return await client.chat.completions.create({ model, messages, temperature: 0.1 });
         } catch (e) {
           lastError = e;
@@ -242,37 +203,32 @@ export class LLMService {
 
     const partials = [];
     try {
-      const chunkRange = getChunkWordRange(formatCfg, chunks.length);
+      const totalSourceWords = chunks.reduce((sum, chunk) => sum + countWords(chunk), 0);
+      const finalRange = getTargetRangeBySourceWords(totalSourceWords, formatCfg.ratio);
       for (let i = 0; i < chunks.length; i++) {
         const text = chunks[i];
+        const chunkWords = countWords(text);
+        const chunkRange = getTargetRangeBySourceWords(chunkWords, formatCfg.ratio);
         const resp = await createCompletionWithFallback([
           {
             role: "system",
             content:
-              `${formatCfg.chunkSystem} Целевой объем для этого чанка: около ${chunkRange.perChunkTarget} слов ` +
+              `${formatCfg.chunkSystem} В чанке примерно ${chunkWords} слов. Целевой объем для этого чанка: около ${chunkRange.targetWords} слов ` +
               `(допустимо ${chunkRange.minWords}-${chunkRange.maxWords}).`,
           },
           { role: "user", content: `Чанк ${i + 1}/${chunks.length}:\n\n${text}` },
         ]);
-        if (providerId === "yandexgpt") {
-          partials.push(`- Пересказ доступен в Yandex 300: ${resp.sharing_url}`);
-          break;
-        }
         partials.push(extractMessageText(resp));
-      }
-
-      if (providerId === "yandexgpt") {
-        return {
-          summary: partials[0] || "",
-          warning: "В режиме YandexGPT используется URL-вход через 300.ya.ru (текст транскрипта не отправляется).",
-        };
       }
 
       const merged = partials.filter(Boolean).join("\n");
       const final = await createCompletionWithFallback([
         {
           role: "system",
-          content: `${formatCfg.finalSystem} Целевой объем: около ${formatCfg.targetWords} слов (допустимо ${formatCfg.minWords}-${formatCfg.maxWords}).`,
+          content:
+            `${formatCfg.finalSystem} Общий объем исходного текста: примерно ${totalSourceWords} слов. ` +
+            `Целевой объем финального пересказа: около ${finalRange.targetWords} слов ` +
+            `(допустимо ${finalRange.minWords}-${finalRange.maxWords}).`,
         },
         { role: "user", content: merged },
       ]);
@@ -281,12 +237,12 @@ export class LLMService {
       // Дополнительный дожим объема: если модель сильно вышла из диапазона, просим переписать под целевой размер.
       for (let attempt = 0; attempt < 2; attempt++) {
         const wc = countWords(summaryText);
-        if (wc >= formatCfg.minWords && wc <= formatCfg.maxWords) break;
+        if (wc >= finalRange.minWords && wc <= finalRange.maxWords) break;
         const adjust = await createCompletionWithFallback([
           {
             role: "system",
             content:
-              `Перепиши пересказ в диапазон ${formatCfg.minWords}-${formatCfg.maxWords} слов (цель ${formatCfg.targetWords}). ` +
+              `Перепиши пересказ в диапазон ${finalRange.minWords}-${finalRange.maxWords} слов (цель ${finalRange.targetWords}). ` +
               "Сохрани факты, убери повторы, не добавляй вымышленные детали, формат без буллетов.",
           },
           { role: "user", content: summaryText },
