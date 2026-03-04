@@ -1,6 +1,7 @@
 ﻿import OpenAI from "openai";
 
 export const DEFAULT_LLM_PROVIDER = "deepseek";
+export const DEFAULT_SUMMARY_FORMAT = "short";
 
 // Единая конфигурация провайдеров LLM и моделей по умолчанию.
 export const LLM_PROVIDERS = {
@@ -39,6 +40,39 @@ export const LLM_PROVIDERS = {
   },
 };
 
+const SUMMARY_FORMATS = {
+  short: {
+    chunkSystem:
+      "Сделай сжатый пересказ чанка по фактам, без воды и повторов.",
+    finalSystem:
+      "Собери единый пересказ по всем чанкам. Структурируй по смысловым блокам с короткими заголовками, без буллетов и без повторов.",
+    targetWords: 1000,
+    minWords: 850,
+    maxWords: 1150,
+    localSentences: 12,
+  },
+  medium: {
+    chunkSystem:
+      "Сделай структурированный пересказ чанка по фактам, с ключевыми деталями и контекстом.",
+    finalSystem:
+      "Собери единый пересказ по всем чанкам. Структурируй по смысловым блокам с короткими заголовками, без буллетов, с ключевыми деталями и причинно-следственными связями.",
+    targetWords: 2500,
+    minWords: 2100,
+    maxWords: 2900,
+    localSentences: 20,
+  },
+  detailed: {
+    chunkSystem:
+      "Сделай подробный пересказ чанка по фактам: важные детали, цифры, имена, термины, позиции говорящих.",
+    finalSystem:
+      "Собери единый подробный пересказ по всем чанкам. Раздели по смысловым блокам с короткими заголовками, без буллетов, сохрани важные детали и убери повторы.",
+    targetWords: 6000,
+    minWords: 5200,
+    maxWords: 6800,
+    localSentences: 32,
+  },
+};
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -59,17 +93,30 @@ function extractMessageText(resp) {
   return "";
 }
 
-function buildLocalSummaryFromChunks(items) {
+function buildLocalSummaryFromChunks(items, sentenceLimit = 12) {
   const all = items.join("\n").replace(/\s+/g, " ").trim();
   const sentences = all
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 40);
-  const picked = sentences.slice(0, 12);
+  const picked = sentences.slice(0, sentenceLimit);
   if (picked.length === 0) {
     return "Локальный пересказ: не удалось выделить содержательные предложения из транскрипта.";
   }
   return picked.map((s) => `- ${s}`).join("\n");
+}
+
+function countWords(text) {
+  if (!text || typeof text !== "string") return 0;
+  return (text.trim().match(/\S+/g) || []).length;
+}
+
+function getChunkWordRange(formatCfg, chunksCount) {
+  const safeChunksCount = Math.max(1, Number(chunksCount) || 1);
+  const perChunkTarget = Math.max(120, Math.round(formatCfg.targetWords / safeChunksCount));
+  const minWords = Math.max(100, Math.round(perChunkTarget * 0.75));
+  const maxWords = Math.max(minWords + 60, Math.round(perChunkTarget * 1.2));
+  return { perChunkTarget, minWords, maxWords };
 }
 
 export class LLMService {
@@ -82,6 +129,12 @@ export class LLMService {
     if (typeof input !== "string") return DEFAULT_LLM_PROVIDER;
     const id = input.trim().toLowerCase();
     return LLM_PROVIDERS[id] ? id : DEFAULT_LLM_PROVIDER;
+  }
+
+  normalizeSummaryFormat(input) {
+    if (typeof input !== "string") return DEFAULT_SUMMARY_FORMAT;
+    const id = input.trim().toLowerCase();
+    return SUMMARY_FORMATS[id] ? id : DEFAULT_SUMMARY_FORMAT;
   }
 
   getProviderConfig(providerId) {
@@ -111,7 +164,9 @@ export class LLMService {
     return `${cfg.apiKeyEnv} не задан. Задайте ключ в UI (или через переменную окружения) и повторите запрос.`;
   }
 
-  async summarizeChunks(chunks, { providerId, sourceUrl }) {
+  async summarizeChunks(chunks, { providerId, summaryFormat, sourceUrl }) {
+    const normalizedFormat = this.normalizeSummaryFormat(summaryFormat);
+    const formatCfg = SUMMARY_FORMATS[normalizedFormat];
     const client = this.getProviderClient(providerId);
     if (providerId !== "yandexgpt" && !client) return { summary: this.getMissingKeyMessage(providerId) };
     if (providerId === "yandexgpt" && !this.env.YANDEXGPT_API_KEY) return { summary: this.getMissingKeyMessage(providerId) };
@@ -187,10 +242,16 @@ export class LLMService {
 
     const partials = [];
     try {
+      const chunkRange = getChunkWordRange(formatCfg, chunks.length);
       for (let i = 0; i < chunks.length; i++) {
         const text = chunks[i];
         const resp = await createCompletionWithFallback([
-          { role: "system", content: "Суммируй текст кратко и строго по фактам. 3-6 буллетов, без воды." },
+          {
+            role: "system",
+            content:
+              `${formatCfg.chunkSystem} Целевой объем для этого чанка: около ${chunkRange.perChunkTarget} слов ` +
+              `(допустимо ${chunkRange.minWords}-${chunkRange.maxWords}).`,
+          },
           { role: "user", content: `Чанк ${i + 1}/${chunks.length}:\n\n${text}` },
         ]);
         if (providerId === "yandexgpt") {
@@ -209,10 +270,33 @@ export class LLMService {
 
       const merged = partials.filter(Boolean).join("\n");
       const final = await createCompletionWithFallback([
-        { role: "system", content: "Собери единый краткий пересказ. 8-14 буллетов. Без повторов. По сути." },
+        {
+          role: "system",
+          content: `${formatCfg.finalSystem} Целевой объем: около ${formatCfg.targetWords} слов (допустимо ${formatCfg.minWords}-${formatCfg.maxWords}).`,
+        },
         { role: "user", content: merged },
       ]);
-      return { summary: extractMessageText(final) };
+      let summaryText = extractMessageText(final);
+
+      // Дополнительный дожим объема: если модель сильно вышла из диапазона, просим переписать под целевой размер.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const wc = countWords(summaryText);
+        if (wc >= formatCfg.minWords && wc <= formatCfg.maxWords) break;
+        const adjust = await createCompletionWithFallback([
+          {
+            role: "system",
+            content:
+              `Перепиши пересказ в диапазон ${formatCfg.minWords}-${formatCfg.maxWords} слов (цель ${formatCfg.targetWords}). ` +
+              "Сохрани факты, убери повторы, не добавляй вымышленные детали, формат без буллетов.",
+          },
+          { role: "user", content: summaryText },
+        ]);
+        const adjustedText = extractMessageText(adjust);
+        if (!adjustedText) break;
+        summaryText = adjustedText;
+      }
+
+      return { summary: summaryText };
     } catch (e) {
       const status = e?.status || e?.response?.status;
       const msg = String(e?.message || "");
@@ -225,7 +309,7 @@ export class LLMService {
         msg.toLowerCase().includes("country, region, or territory not supported");
       if (!regionBlocked) throw e;
       return {
-        summary: buildLocalSummaryFromChunks(chunks),
+        summary: buildLocalSummaryFromChunks(chunks, formatCfg.localSentences),
         warning: "OpenAI недоступен для текущего региона (403). Показан локальный офлайн-пересказ из транскрипта.",
       };
     }

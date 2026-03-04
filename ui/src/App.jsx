@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState } from "react";
+﻿import React, { useEffect, useMemo, useRef, useState } from "react";
 import { isValidVkMask } from "./vkUrlRules";
 
 /**
@@ -80,9 +80,23 @@ function delay(ms, signal) {
 }
 
 const BASE_STEP_LABELS = [
-  "Скачивание аудио (yt-dlp → wav)",
-  "Транскрипция (WhisperX + diarization → txt)",
+  "Скачивание аудио (yt-dlp > wav)",
+  "Транскрипция (WhisperX + diarization > txt)",
   "Разбиение на чанки (split_whisperx.py)",
+];
+
+const START_STEP_INPUT_LABELS = {
+  1: "Ссылка на видео",
+  2: ".wav файл",
+  3: ".txt файл транскрипта",
+  4: ".txt файл для пересказа",
+};
+
+const ROUTE_STEP_LABELS = [
+  "\u0421\u043a\u0430\u0447\u0438\u0432\u0430\u043d\u0438\u0435 \u0430\u0443\u0434\u0438\u043e",
+  "\u0422\u0440\u0430\u043d\u0441\u043a\u0440\u0438\u043f\u0446\u0438\u044f",
+  "\u0420\u0430\u0437\u0431\u0438\u0435\u043d\u0438\u0435 \u043d\u0430 \u0447\u0430\u043d\u043a\u0438",
+  "\u041f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043a\u0430 \u043f\u0435\u0440\u0435\u0441\u043a\u0430\u0437\u0430",
 ];
 
 const LLM_OPTIONS = [
@@ -133,21 +147,61 @@ const LLM_OPTIONS = [
   },
 ];
 
-function buildStepLabels(providerId) {
+const SUMMARY_FORMAT_OPTIONS = [
+  { id: "short", label: "Краткий" },
+  { id: "medium", label: "Средний" },
+  { id: "detailed", label: "Подробный" },
+];
+
+function getSummaryFormatLabel(summaryFormat) {
+  return SUMMARY_FORMAT_OPTIONS.find((f) => f.id === summaryFormat)?.label || "Краткий";
+}
+
+async function postFormData(url, formData, signal) {
+  const res = await fetch(url, {
+    method: "POST",
+    body: formData,
+    signal,
+  });
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.data = json;
+    throw err;
+  }
+  return json;
+}
+
+function buildStepLabels(providerId, summaryFormat) {
   const provider = LLM_OPTIONS.find((p) => p.id === providerId);
   const llmLabel = provider?.label || "LLM";
-  return [...BASE_STEP_LABELS, `Краткий пересказ (${llmLabel})`];
+  const summaryLabel = getSummaryFormatLabel(summaryFormat);
+  return [...BASE_STEP_LABELS, `${summaryLabel} пересказ (${llmLabel})`];
 }
 
 export default function App() {
   const [url, setUrl] = useState("");
   const isLinkValid = useMemo(() => url.trim().length > 0 && isValidVkMask(url), [url]);
+  const [startStep, setStartStep] = useState(1);
+  const [audioFile, setAudioFile] = useState(null);
+  const [transcriptFile, setTranscriptFile] = useState(null);
+  const [summarySourceFile, setSummarySourceFile] = useState(null);
 
-  const [mode, setMode] = useState("summary"); // summary
+  const mode = "summary";
+  const [activeTab, setActiveTab] = useState("run");
   const [llmProvider, setLlmProvider] = useState("deepseek");
+  const [summaryFormat, setSummaryFormat] = useState("short");
 
   // Опции пересказа
-  const [useDefaults, setUseDefaults] = useState(true);
   const [wordLimitEnabled, setWordLimitEnabled] = useState(false);
   const [wordLimit, setWordLimit] = useState("20000");
   const [cleanFiller, setCleanFiller] = useState(true);
@@ -182,13 +236,85 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [envBusy, setEnvBusy] = useState(false);
   const [showLlmKey, setShowLlmKey] = useState(false);
-  const stepLabels = useMemo(() => buildStepLabels(llmProvider), [llmProvider]);
+  const [showHfToken, setShowHfToken] = useState(false);
+  const resultSectionRef = useRef(null);
+  const stepLabels = useMemo(() => buildStepLabels(llmProvider, summaryFormat), [llmProvider, summaryFormat]);
   const selectedProvider = useMemo(
     () => LLM_OPTIONS.find((p) => p.id === llmProvider) || LLM_OPTIONS[0],
     [llmProvider]
   );
+  function scrollToResultSmooth() {
+    const target = resultSectionRef.current;
+    if (!target) return;
+    const startY = window.scrollY || window.pageYOffset || 0;
+    const targetY = target.getBoundingClientRect().top + startY - 12;
+    const distance = targetY - startY;
+    const durationMs = 500;
+    const startedAt = performance.now();
+    const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2);
+    const tick = (now) => {
+      const elapsed = now - startedAt;
+      const progress = Math.min(1, elapsed / durationMs);
+      const eased = easeInOut(progress);
+      window.scrollTo(0, startY + distance * eased);
+      if (progress < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
 
-  const canRun = url.trim().length > 0 && mode === "summary" && isLinkValid;
+  function getInputErrorByStep(step) {
+    const trimmed = url.trim();
+    if (step === 1) {
+      if (!trimmed) return "Введите ссылку на VK видео.";
+      try {
+        // eslint-disable-next-line no-new
+        new URL(trimmed);
+      } catch {
+        return "Ссылка выглядит некорректно. Пример: https://vk.com/... или https://vkvideo.ru/video-...";
+      }
+      if (!isValidVkMask(trimmed)) {
+        return "Ссылка не подходит под маску VK.";
+      }
+      return "";
+    }
+
+    if (step === 2) {
+      if (!audioFile) return "Выберите .wav файл для транскрипции.";
+      if (!String(audioFile.name || "").toLowerCase().endsWith(".wav")) return "Допустим только .wav файл.";
+      return "";
+    }
+
+    if (step === 3) {
+      if (!transcriptFile) return "Выберите .txt файл транскрипта.";
+      if (!String(transcriptFile.name || "").toLowerCase().endsWith(".txt")) return "Допустим только .txt файл.";
+      return "";
+    }
+
+    if (step === 4) {
+      if (!summarySourceFile) return "Выберите .txt файл для пересказа.";
+      if (!String(summarySourceFile.name || "").toLowerCase().endsWith(".txt")) return "Допустим только .txt файл.";
+      return "";
+    }
+
+    return "Некорректный номер шага.";
+  }
+
+  const canRun = mode === "summary" && getInputErrorByStep(startStep) === "";
+  function getRouteHintFromStep(step) {
+    const from = Math.max(1, Math.min(4, Number(step) || 1));
+    return ROUTE_STEP_LABELS.slice(from - 1).join(" -> ");
+  }
+  const routeHint = useMemo(() => {
+    return getRouteHintFromStep(startStep);
+  }, [startStep]);
+  function getStepDurationText(step) {
+    const stepIdx = step - 1;
+    const doneMs = Number(stepDurationsMs?.[stepIdx]);
+    const hasDoneDuration = Number.isFinite(doneMs) && doneMs >= 0;
+    if (isRunning && stepIndex === stepIdx) return `${(activeStepElapsedMs / 1000).toFixed(1)} \u0441\u0435\u043a`;
+    if (hasDoneDuration) return `${(doneMs / 1000).toFixed(1)} \u0441\u0435\u043a`;
+    return "";
+  }
 
   useEffect(() => {
     syncEnvStatus().catch(() => {});
@@ -280,6 +406,7 @@ export default function App() {
         openai_api_key_set: Boolean(data?.openai_api_key_set),
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
+        gemini_api_key_set: Boolean(data?.gemini_api_key_set),
         yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
@@ -303,6 +430,7 @@ export default function App() {
         openai_api_key_set: Boolean(data?.openai_api_key_set),
         deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
         grok_api_key_set: Boolean(data?.grok_api_key_set),
+        gemini_api_key_set: Boolean(data?.gemini_api_key_set),
         yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
         hf_token_set: Boolean(data?.hf_token_set),
       });
@@ -314,17 +442,60 @@ export default function App() {
     }
   }
 
-  function applyDefaultsOnToggle(nextUseDefaults) {
-    setUseDefaults(nextUseDefaults);
-    if (nextUseDefaults) {
-      setWordLimitEnabled(false);
-      setWordLimit("20000");
-      setCleanFiller(true);
-      setShowLog(false);
+  async function onResetLlmKey() {
+    setLlmKeys((prev) => ({
+      ...prev,
+      [llmProvider]: "",
+    }));
+    setEnvBusy(true);
+    try {
+      const keyFieldByProvider = {
+        openai: "openai_api_key",
+        deepseek: "deepseek_api_key",
+        grok: "grok_api_key",
+        gemini: "gemini_api_key",
+        yandexgpt: "yandexgpt_api_key",
+      };
+      const field = keyFieldByProvider[llmProvider] || "openai_api_key";
+      const data = await postJson("/api/env/set", { [field]: "" });
+      setEnvStatus({
+        openai_api_key_set: Boolean(data?.openai_api_key_set),
+        deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
+        grok_api_key_set: Boolean(data?.grok_api_key_set),
+        gemini_api_key_set: Boolean(data?.gemini_api_key_set),
+        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
+        hf_token_set: Boolean(data?.hf_token_set),
+      });
+      pushToast(`${selectedProvider.keyName} очищен.`, "success");
+    } catch (e) {
+      pushToast(e?.message || `Не удалось очистить ${selectedProvider.keyName}.`, "error");
+    } finally {
+      setEnvBusy(false);
     }
   }
 
-  async function onRun() {
+  async function onResetHF() {
+    setHfToken("");
+    setEnvBusy(true);
+    try {
+      const data = await postJson("/api/env/set", { hf_token: "" });
+      setEnvStatus({
+        openai_api_key_set: Boolean(data?.openai_api_key_set),
+        deepseek_api_key_set: Boolean(data?.deepseek_api_key_set),
+        grok_api_key_set: Boolean(data?.grok_api_key_set),
+        gemini_api_key_set: Boolean(data?.gemini_api_key_set),
+        yandexgpt_api_key_set: Boolean(data?.yandexgpt_api_key_set),
+        hf_token_set: Boolean(data?.hf_token_set),
+      });
+      pushToast("HF_TOKEN очищен.", "success");
+    } catch (e) {
+      pushToast(e?.message || "Не удалось очистить HF_TOKEN.", "error");
+    } finally {
+      setEnvBusy(false);
+    }
+  }
+
+  async function onRun(forcedStep = startStep) {
     setError("");
     setResultText("");
     setPipelineLog("");
@@ -334,26 +505,11 @@ export default function App() {
     setActiveStepStartedAt(null);
     setActiveStepElapsedMs(0);
 
-    const trimmed = url.trim();
-    if (!trimmed) {
-      setError("Введите ссылку на VK видео.");
-      return;
-    }
-
-    try {
-      // eslint-disable-next-line no-new
-      new URL(trimmed);
-    } catch {
-      setError(
-        "Ссылка выглядит некорректно. Примеры: https://vk.com/abc?z=video-123456 или https://vkvideo.ru/video-123456"
-      );
-      return;
-    }
-
-    if (!isValidVkMask(trimmed)) {
-      setError(
-        "Ссылка не подходит под маску. Нужны форматы: https://vk.com/{sometext}?z=video-{number} или https://vkvideo.ru/video-{number}"
-      );
+    const resolvedStep = Math.max(1, Math.min(4, Number(forcedStep) || 1));
+    setStartStep(resolvedStep);
+    const inputError = getInputErrorByStep(resolvedStep);
+    if (inputError) {
+      setError(inputError);
       return;
     }
 
@@ -363,28 +519,67 @@ export default function App() {
       return;
     }
 
+    const trimmed = url.trim();
+    if (resolvedStep === 1) {
+      if (!trimmed) {
+        setError("Введите ссылку на VK видео.");
+        return;
+      }
+
+      try {
+        // eslint-disable-next-line no-new
+        new URL(trimmed);
+      } catch {
+        setError(
+          "Ссылка выглядит некорректно. Примеры: https://vk.com/abc?z=video-123456 или https://vkvideo.ru/video-123456"
+        );
+        return;
+      }
+
+      if (!isValidVkMask(trimmed)) {
+        setError(
+          "Ссылка не подходит под маску. Нужны форматы: https://vk.com/{sometext}?z=video-{number} или https://vkvideo.ru/video-{number}"
+        );
+        return;
+      }
+    }
+
     const ctrl = new AbortController();
     setAbortCtrl(ctrl);
 
     setIsRunning(true);
     try {
-      setStepIndex(0);
+      setStepIndex(resolvedStep - 1);
       setActiveStepStartedAt(Date.now());
       setActiveStepElapsedMs(0);
-      const startJson = await postJson(
-        "/api/vk/summary",
-        {
-          url: trimmed,
-          options: {
-            llm_provider: llmProvider,
-            word_limit: wl, // null => default
-            clean: cleanFiller,
-            log: showLog,
-            async: true,
+      const commonOptions = {
+        llm_provider: llmProvider,
+        summary_format: summaryFormat,
+        word_limit: wl, // null => default
+        clean: cleanFiller,
+        log: showLog,
+        async: true,
+      };
+
+      let startJson = null;
+      if (resolvedStep === 1) {
+        startJson = await postJson(
+          "/api/vk/summary",
+          {
+            url: trimmed,
+            options: commonOptions,
           },
-        },
-        ctrl.signal
-      );
+          ctrl.signal
+        );
+      } else {
+        const inputFile = resolvedStep === 2 ? audioFile : resolvedStep === 3 ? transcriptFile : summarySourceFile;
+        const formData = new FormData();
+        formData.append("start_step", String(resolvedStep));
+        if (trimmed) formData.append("url", trimmed);
+        formData.append("options", JSON.stringify(commonOptions));
+        formData.append("input_file", inputFile);
+        startJson = await postFormData("/api/pipeline/summary", formData, ctrl.signal);
+      }
 
       if (startJson?.job_id) {
         while (true) {
@@ -401,11 +596,13 @@ export default function App() {
             setActiveStepStartedAt(null);
             setResultText(statusJson?.summary || "");
             if (!statusJson?.summary) setError("Backend не вернул пересказ.");
+            setTimeout(() => scrollToResultSmooth(), 0);
             break;
           }
           if (statusJson?.status === "error") {
             setActiveStepStartedAt(null);
             setError(statusJson?.error || "Не удалось выполнить пересказ.");
+            setTimeout(() => scrollToResultSmooth(), 0);
             break;
           }
         }
@@ -420,6 +617,7 @@ export default function App() {
         if (!startJson?.summary) {
           setError("Backend не вернул пересказ.");
         }
+        setTimeout(() => scrollToResultSmooth(), 0);
       }
     } catch (e) {
       if (e?.name === "AbortError") {
@@ -429,6 +627,7 @@ export default function App() {
         setStepDurationsMs(Array.isArray(e?.data?.step_durations_ms) ? e.data.step_durations_ms : []);
         setError(e?.message || "Не удалось выполнить пересказ.");
       }
+      setTimeout(() => scrollToResultSmooth(), 0);
     } finally {
       setIsRunning(false);
       setActiveStepStartedAt(null);
@@ -444,60 +643,180 @@ export default function App() {
         </header>
 
         <section className="rounded-2xl bg-white shadow-sm ring-1 ring-neutral-200 p-5">
+          <div className="mb-4 flex gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveTab("run")}
+              disabled={isRunning}
+              className={`rounded-xl px-3 py-2 text-sm ring-1 ${
+                activeTab === "run"
+                  ? "bg-neutral-900 text-white ring-neutral-900"
+                  : "bg-white text-neutral-900 ring-neutral-200 hover:bg-neutral-50"
+              }`}
+            >
+              Запуск
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("settings")}
+              disabled={isRunning}
+              className={`rounded-xl px-3 py-2 text-sm ring-1 ${
+                activeTab === "settings"
+                  ? "bg-neutral-900 text-white ring-neutral-900"
+                  : "bg-white text-neutral-900 ring-neutral-200 hover:bg-neutral-50"
+              }`}
+            >
+              Настройки
+            </button>
+          </div>
           <div className="grid gap-4">
-            <div>
-              <label className="text-sm font-medium">Ссылка на видео</label>
-              <div className="mt-2 flex gap-2">
-                <input
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
-                />
-                <div className="shrink-0 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm">
-                  <span className="text-neutral-500">Ссылка:</span>{" "}
-                  <span
-                    className={`font-medium ${
-                      !url.trim() ? "text-neutral-400" : isLinkValid ? "text-emerald-600" : "text-red-600"
-                    }`}
-                  >
-                    {!url.trim() ? "—" : isLinkValid ? "верная" : "не подходит"}
-                  </span>
-                </div>
-              </div>
-            </div>
 
-            <div>
-              <label className="text-sm font-medium">Что сделать</label>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => setMode("summary")}
-                  className={`rounded-xl px-3 py-2 text-sm ring-1 ${
-                    mode === "summary"
-                      ? "bg-neutral-900 text-white ring-neutral-900"
-                      : "bg-white text-neutral-900 ring-neutral-200 hover:bg-neutral-50"
-                  }`}
-                >
-                  Краткий пересказ
-                </button>
-                <button
-                  type="button"
-                  disabled
-                  className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 bg-neutral-50 text-neutral-400 cursor-not-allowed"
-                >
-                  Shorts (позже)
-                </button>
-                <button
-                  type="button"
-                  disabled
-                  className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 bg-neutral-50 text-neutral-400 cursor-not-allowed"
-                >
-                  Highlight (позже)
-                </button>
-              </div>
-              <p className="mt-2 text-sm text-neutral-600">Сейчас поддерживается только VK и только «краткий пересказ».</p>
-            </div>
+            {activeTab === "run" && (
+              <>
+            <div className="rounded-2xl border border-neutral-200 p-4">
+              <div className="text-sm font-medium">Старт пайплайна</div>
+              <div className="mt-1 text-xs text-neutral-600">Выберите шаг и нажмите "Начать с этого шага".</div>
+              <div className="mt-3 grid gap-3">
+                {[1, 2, 3, 4].map((step) => {
+                  const isSelected = startStep === step;
+                  const isRunningStep = isRunning && stepIndex === step - 1;
+                  const stepTitle = stepLabels[step - 1] || `Шаг ${step}`;
+                  const inputError = getInputErrorByStep(step);
+                  const durationText = getStepDurationText(step);
+                  return (
+                    <div
+                      key={step}
+                      className={`rounded-xl border p-3 ${
+                        isRunningStep
+                          ? "border-emerald-500 bg-emerald-50"
+                          : isSelected
+                          ? "border-neutral-900 bg-neutral-50"
+                          : "border-neutral-200 bg-white"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isRunning) return;
+                          setStartStep(step);
+                        }}
+                        disabled={isRunning}
+                        className="flex w-full items-center justify-between gap-2 text-left"
+                      >
+                        <div className="text-sm font-medium">
+                          {step}. {stepTitle}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {durationText && (
+                            <span className={`text-xs ${isRunningStep ? "text-emerald-700 font-medium" : "text-neutral-600"}`}>
+                              {durationText}
+                            </span>
+                          )}
+                          {isRunningStep && (
+                            <span className="rounded-lg bg-emerald-600 px-2 py-1 text-xs font-medium text-white">в работе</span>
+                          )}
+                          {isSelected && (
+                            <span className="rounded-lg bg-neutral-900 px-2 py-1 text-xs font-medium text-white">выбран</span>
+                          )}
+                        </div>
+                      </button>
 
+                      <div
+                        className={`grid transition-all duration-500 ease-in-out ${
+                          isSelected ? "mt-3 grid-rows-[1fr] opacity-100" : "mt-0 grid-rows-[0fr] opacity-0"
+                        }`}
+                      >
+                        <div className="overflow-hidden">
+                          <label className="mt-3 block text-xs font-medium text-neutral-600">{START_STEP_INPUT_LABELS[step]}</label>
+                          {step === 1 && (
+                            <div className="mt-2 flex gap-2">
+                              <input
+                                value={url}
+                                onChange={(e) => setUrl(e.target.value)}
+                                disabled={isRunning}
+                                placeholder="https://vk.com/... или https://vkvideo.ru/video-..."
+                                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                              />
+                              <div className="shrink-0 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                                <span className="text-neutral-500">Ссылка:</span>{" "}
+                                <span
+                                  className={`font-medium ${
+                                    !url.trim() ? "text-neutral-400" : isLinkValid ? "text-emerald-600" : "text-red-600"
+                                  }`}
+                                >
+                                  {!url.trim() ? "—" : isLinkValid ? "верная" : "не подходит"}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          {step === 2 && (
+                            <div className="mt-2">
+                              <input
+                                type="file"
+                                accept=".wav,audio/wav"
+                                disabled={isRunning}
+                                onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+                                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-900 file:px-3 file:py-1 file:text-xs file:text-white"
+                              />
+                              <div className="mt-1 text-xs text-neutral-500">{audioFile ? audioFile.name : "Файл не выбран"}</div>
+                            </div>
+                          )}
+
+                          {step === 3 && (
+                            <div className="mt-2">
+                              <input
+                                type="file"
+                                accept=".txt,text/plain"
+                                disabled={isRunning}
+                                onChange={(e) => setTranscriptFile(e.target.files?.[0] || null)}
+                                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-900 file:px-3 file:py-1 file:text-xs file:text-white"
+                              />
+                              <div className="mt-1 text-xs text-neutral-500">{transcriptFile ? transcriptFile.name : "Файл не выбран"}</div>
+                            </div>
+                          )}
+
+                          {step === 4 && (
+                            <div className="mt-2">
+                              <input
+                                type="file"
+                                accept=".txt,text/plain"
+                                disabled={isRunning}
+                                onChange={(e) => setSummarySourceFile(e.target.files?.[0] || null)}
+                                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-900 file:px-3 file:py-1 file:text-xs file:text-white"
+                              />
+                              <div className="mt-1 text-xs text-neutral-500">
+                                {summarySourceFile ? summarySourceFile.name : "Файл не выбран"}
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="mt-3 flex items-center justify-between gap-2">
+                            <div className={`text-xs ${inputError ? "text-red-600" : "text-neutral-600"}`}>
+                              {inputError || `Будут выполнены шаги: ${getRouteHintFromStep(step)}`}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => onRun(step)}
+                              disabled={isRunning || Boolean(inputError) || mode !== "summary"}
+                              className="rounded-xl bg-neutral-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"
+                            >
+                              Начать с этого шага
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-3 text-xs text-neutral-600">Что будет выполнено: {routeHint}</div>
+            </div>
+              </>
+            )}
+
+            {activeTab === "settings" && (
+              <>
             <div className="rounded-2xl border border-neutral-200 p-4">
               <div className="text-sm font-medium">Переменные окружения</div>
               <div className="mt-1 text-xs text-neutral-600">
@@ -518,8 +837,8 @@ export default function App() {
                   ))}
                 </select>
                 <label className="text-sm font-medium">{selectedProvider.keyName}</label>
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="relative w-full">
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1 min-w-0">
                     <input
                       type={showLlmKey ? "text" : "password"}
                       value={llmKeys[llmProvider] || ""}
@@ -554,22 +873,33 @@ export default function App() {
                       )}
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={onCheckLlmStatus}
-                    disabled={envBusy}
-                    className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
-                  >
-                    Проверить наличие
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onSetLlmKey}
-                    disabled={envBusy}
-                    className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-                  >
-                    Сохранить
-                  </button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={onCheckLlmStatus}
+                      disabled={envBusy}
+                      className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Проверить наличие
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onSetLlmKey}
+                      disabled={envBusy}
+                      className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Сохранить
+                    </button>
+                    
+                    <button
+                      type="button"
+                      onClick={onResetLlmKey}
+                      disabled={envBusy}
+                      className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Сбросить
+                    </button>
+                  </div>
                 </div>
                 <div className="text-xs text-neutral-600">
                   {selectedProvider.keyHelp}{" "}
@@ -586,30 +916,64 @@ export default function App() {
 
               <div className="mt-4 grid gap-3">
                 <label className="text-sm font-medium">HF_TOKEN</label>
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    type="password"
-                    value={hfToken}
-                    onChange={(e) => setHfToken(e.target.value)}
-                    placeholder="hf_..."
-                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
-                  />
-                  <button
-                    type="button"
-                    onClick={onCheckHFStatus}
-                    disabled={envBusy}
-                    className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
-                  >
-                    Проверить наличие
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onSetHF}
-                    disabled={envBusy}
-                    className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-                  >
-                    Сохранить
-                  </button>
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1 min-w-0">
+                    <input
+                      type={showHfToken ? "text" : "password"}
+                      value={hfToken}
+                      onChange={(e) => setHfToken(e.target.value)}
+                      placeholder="hf_..."
+                      className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 pr-10 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowHfToken((v) => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-900"
+                      aria-label={showHfToken ? "Скрыть токен" : "Показать токен"}
+                      title={showHfToken ? "Скрыть" : "Показать"}
+                    >
+                      {showHfToken ? (
+                        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 3l18 18" />
+                          <path d="M10.6 10.6a2 2 0 102.8 2.8" />
+                          <path d="M9.5 5.2A11 11 0 0112 5c5 0 9 4.5 10 7-0.4 1-1.3 2.3-2.5 3.5" />
+                          <path d="M6.7 6.7C4.8 8 3.4 9.7 2 12c1 2.5 5 7 10 7 2.3 0 4.3-.9 6-2.3" />
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z" />
+                          <circle cx="12" cy="12" r="3" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={onCheckHFStatus}
+                      disabled={envBusy}
+                      className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Проверить наличие
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onSetHF}
+                      disabled={envBusy}
+                      className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Сохранить
+                    </button>
+                    
+                    <button
+                      type="button"
+                      onClick={onResetHF}
+                      disabled={envBusy}
+                      className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      Сбросить
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -617,28 +981,31 @@ export default function App() {
 
             {mode === "summary" && (
               <div className="rounded-2xl border border-neutral-200 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-medium">Опции пересказа</div>
-                    <div className="text-xs text-neutral-600">По умолчанию используются безопасные настройки.</div>
-                  </div>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={useDefaults}
-                      onChange={(e) => applyDefaultsOnToggle(e.target.checked)}
-                      className="h-4 w-4"
-                    />
-                    Дефолт
-                  </label>
+                <div>
+                  <div className="text-sm font-medium">Опции пересказа</div>
+                  <div className="text-xs text-neutral-600">Настройки применяются сразу.</div>
                 </div>
 
-                <div className={`mt-4 grid gap-3 ${useDefaults ? "opacity-60" : ""}`}>
+                <div className="mt-4 grid gap-3">
+                  <label className="text-sm">
+                    <span className="mb-1 block">Формат пересказа</span>
+                    <select
+                      value={summaryFormat}
+                      onChange={(e) => setSummaryFormat(e.target.value)}
+                      className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                    >
+                      {SUMMARY_FORMAT_OPTIONS.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
                   <label className="flex items-center justify-between gap-3 text-sm">
                     <span>Задать лимит слов</span>
                     <input
                       type="checkbox"
-                      disabled={useDefaults}
                       checked={wordLimitEnabled}
                       onChange={(e) => setWordLimitEnabled(e.target.checked)}
                       className="h-4 w-4"
@@ -650,7 +1017,7 @@ export default function App() {
                       type="number"
                       min={100}
                       max={200000}
-                      disabled={useDefaults || !wordLimitEnabled}
+                      disabled={!wordLimitEnabled}
                       value={wordLimit}
                       onChange={(e) => setWordLimit(e.target.value)}
                       className="w-40 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300 disabled:bg-neutral-50"
@@ -662,7 +1029,6 @@ export default function App() {
                     <span>Чистить от мусорных слов</span>
                     <input
                       type="checkbox"
-                      disabled={useDefaults}
                       checked={cleanFiller}
                       onChange={(e) => setCleanFiller(e.target.checked)}
                       className="h-4 w-4"
@@ -673,18 +1039,19 @@ export default function App() {
                     <span>Выводить лог</span>
                     <input
                       type="checkbox"
-                      disabled={useDefaults}
                       checked={showLog}
                       onChange={(e) => setShowLog(e.target.checked)}
                       className="h-4 w-4"
                     />
                   </label>
-
-                  {useDefaults && <div className="text-xs text-neutral-600">Чтобы менять опции, выключите «Дефолт».</div>}
                 </div>
               </div>
             )}
+              </>
+            )}
 
+            {activeTab === "run" && (
+              <>
             {error && (
               <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div>
             )}
@@ -696,80 +1063,14 @@ export default function App() {
               </div>
             )}
 
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                onClick={onRun}
-                disabled={!canRun || isRunning}
-                className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-              >
-                {isRunning ? "Выполняю…" : "Сделать пересказ"}
-              </button>
+              </>
+            )}
 
-              {isRunning && (
-                <button
-                  type="button"
-                  onClick={() => abortCtrl?.abort()}
-                  className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50"
-                >
-                  Отменить
-                </button>
-              )}
-
-              <div className="text-xs text-neutral-600">
-                UI вызывает <span className="font-mono">POST /api/vk/summary</span>.
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-neutral-200 p-4">
-              <div className="text-sm font-medium">Пайплайн</div>
-              <ol className="mt-2 grid gap-2">
-                {stepLabels.map((label, i) => {
-                  const state =
-                    stepIndex < 0 ? "idle" : i < stepIndex ? "done" : i === stepIndex ? "active" : "todo";
-                  const durationMs = Number(stepDurationsMs?.[i]);
-                  const hasDuration = Number.isFinite(durationMs) && durationMs >= 0;
-                  const durationText = hasDuration ? `${(durationMs / 1000).toFixed(1)}с` : "";
-                  const liveDurationText = `${(activeStepElapsedMs / 1000).toFixed(1)}с`;
-                  return (
-                    <li key={label} className="flex items-center justify-between gap-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ring-1 ${
-                            state === "done"
-                              ? "bg-neutral-900 text-white ring-neutral-900"
-                              : state === "active"
-                              ? "bg-neutral-100 text-neutral-900 ring-neutral-300"
-                              : "bg-white text-neutral-400 ring-neutral-200"
-                          }`}
-                        >
-                          {i + 1}
-                        </span>
-                        <span className={state === "todo" ? "text-neutral-400" : "text-neutral-900"}>{label}</span>
-                      </div>
-                      <span className="text-xs text-neutral-500">
-                        {state === "done"
-                          ? hasDuration
-                            ? `готово • ${durationText}`
-                            : "готово"
-                          : state === "active"
-                          ? isRunning
-                            ? `в работе • ${liveDurationText}`
-                            : hasDuration
-                            ? durationText
-                            : ""
-                          : ""}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ol>
-              <div className="mt-3 text-xs text-neutral-600">Реальный прогресс возможен, если backend возвращает steps/log.</div>
-            </div>
+            
           </div>
         </section>
 
-        <section className="mt-6 rounded-2xl bg-white shadow-sm ring-1 ring-neutral-200 p-5">
+        <section ref={resultSectionRef} className="mt-6 rounded-2xl bg-white shadow-sm ring-1 ring-neutral-200 p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-base font-semibold">Результат</h2>
             {resultText && (
@@ -784,7 +1085,7 @@ export default function App() {
           </div>
 
           {!resultText ? (
-            <p className="mt-3 text-sm text-neutral-600">Пока пусто. Введите VK-ссылку и нажмите «Сделать пересказ».</p>
+            <p className="mt-3 text-sm text-neutral-600">Пока пусто. Выберите стартовый шаг, задайте входные данные и нажмите запуск.</p>
           ) : (
             <pre className="mt-3 whitespace-pre-wrap rounded-xl bg-neutral-50 p-4 text-sm leading-relaxed ring-1 ring-neutral-200">
               {resultText}
@@ -806,7 +1107,7 @@ export default function App() {
         </section>
 
         <footer className="mt-6 text-xs text-neutral-500">
-          VK-only MVP. Для работы backend нужны: yt-dlp, ffmpeg, python + whisperx, HF_TOKEN и ключ выбранного LLM.
+          MVP: запуск с шагов 1-4. Для backend нужны: yt-dlp/ffmpeg (если старт с шага 1), python + whisperx (если старт с шага 1-2), HF_TOKEN и ключ выбранного LLM.
         </footer>
       </div>
 
@@ -838,4 +1139,5 @@ export default function App() {
     </div>
   );
 }
+
 

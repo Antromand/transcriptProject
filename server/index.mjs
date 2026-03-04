@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // Компонуем приложение из сервисов (OOP-композиция вместо монолита).
-const envService = new EnvService({ env: process.env });
+const envService = new EnvService({ env: process.env, workRoot: config.workRoot });
 const llmService = new LLMService({ env: process.env, fetchImpl: fetch });
 const pipelineService = new SummaryPipelineService({
   workRoot: config.workRoot,
@@ -48,13 +48,19 @@ app.get("/api/env/status", (_req, res) => {
   res.json(envService.buildStatusPayload());
 });
 
-app.post("/api/env/set", (req, res) => {
-  envService.applyUpdatesFromBody(req.body || {});
+app.post("/api/env/set", async (req, res) => {
+  await envService.applyUpdatesFromBody(req.body || {});
+  res.json({ ok: true, ...envService.buildStatusPayload() });
+});
+
+app.post("/api/env/reset", async (_req, res) => {
+  await envService.clearAllSecrets();
   res.json({ ok: true, ...envService.buildStatusPayload() });
 });
 
 app.get("/api/vk/summary/status/:jobId", (req, res) => summaryController.getStatus(req, res));
 app.post("/api/vk/summary", (req, res) => summaryController.create(req, res));
+app.post("/api/pipeline/summary", (req, res) => summaryController.createFromStart(req, res));
 
 if (existsSync(config.uiDist)) {
   app.use(express.static(config.uiDist));
@@ -65,5 +71,6 @@ if (existsSync(config.uiDist)) {
 
 app.listen(config.port, async () => {
   await fs.mkdir(config.workRoot, { recursive: true });
+  await envService.init();
   console.log(`Server: http://localhost:${config.port}`);
 });
