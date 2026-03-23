@@ -217,6 +217,7 @@ export class SummaryController {
       warnings: [],
       stepDurationsMs: [null, null, null, null],
       currentStepStartedAt: null,
+      currentStepProgress: { percent: null, label: "" },
       log: "",
       summary: "",
       error: "",
@@ -232,6 +233,7 @@ export class SummaryController {
     job.currentProcess = null;
     job.finishedAt = new Date().toISOString();
     job.currentStepStartedAt = null;
+    job.currentStepProgress = { percent: null, label: "" };
     await this.auditLogger.append(this.auditLogger.buildRecord(job));
     await this.cleanupOldWorkResults();
   }

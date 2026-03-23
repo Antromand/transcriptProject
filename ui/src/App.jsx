@@ -226,6 +226,8 @@ export default function App() {
   const [warnings, setWarnings] = useState([]);
   const [stepIndex, setStepIndex] = useState(-1);
   const [stepDurationsMs, setStepDurationsMs] = useState([]);
+  const [currentStepProgressPct, setCurrentStepProgressPct] = useState(null);
+  const [currentStepProgressLabel, setCurrentStepProgressLabel] = useState("");
   const [activeStepStartedAt, setActiveStepStartedAt] = useState(null);
   const [activeStepElapsedMs, setActiveStepElapsedMs] = useState(0);
   const [abortCtrl, setAbortCtrl] = useState(null);
@@ -527,6 +529,8 @@ export default function App() {
     setWarnings([]);
     setStepIndex(-1);
     setStepDurationsMs([]);
+    setCurrentStepProgressPct(null);
+    setCurrentStepProgressLabel("");
     setActiveStepStartedAt(null);
     setActiveStepElapsedMs(0);
     setCurrentJobId("");
@@ -630,6 +634,10 @@ export default function App() {
           const statusJson = await getJson(`/api/video/summary/status/${startJson.job_id}`, ctrl.signal);
 
           if (typeof statusJson?.steps === "number") setStepIndex(Math.min(stepLabels.length - 1, statusJson.steps));
+          setCurrentStepProgressPct(
+            Number.isFinite(statusJson?.current_step_progress_pct) ? statusJson.current_step_progress_pct : null
+          );
+          setCurrentStepProgressLabel(statusJson?.current_step_progress_label || "");
           setWarnings(Array.isArray(statusJson?.warnings) ? statusJson.warnings : []);
           setStepDurationsMs(Array.isArray(statusJson?.step_durations_ms) ? statusJson.step_durations_ms : []);
           if (showLog) setPipelineLog(statusJson?.log || "");
@@ -637,6 +645,8 @@ export default function App() {
           if (statusJson?.status === "done") {
             setStepIndex(stepLabels.length);
             setActiveStepStartedAt(null);
+            setCurrentStepProgressPct(null);
+            setCurrentStepProgressLabel("");
             setResultText(statusJson?.summary || "");
             setCurrentJobId("");
             if (!statusJson?.summary) setError("Backend не вернул пересказ.");
@@ -645,6 +655,8 @@ export default function App() {
           }
           if (statusJson?.status === "error") {
             setActiveStepStartedAt(null);
+            setCurrentStepProgressPct(null);
+            setCurrentStepProgressLabel("");
             setCurrentJobId("");
             setError(statusJson?.error || "Не удалось выполнить пересказ.");
             setTimeout(() => scrollToResultSmooth(), 0);
@@ -652,6 +664,8 @@ export default function App() {
           }
           if (statusJson?.status === "canceled") {
             setActiveStepStartedAt(null);
+            setCurrentStepProgressPct(null);
+            setCurrentStepProgressLabel("");
             setCurrentJobId("");
             setError(statusJson?.error || "Остановлено пользователем.");
             setTimeout(() => scrollToResultSmooth(), 0);
@@ -662,6 +676,8 @@ export default function App() {
         if (typeof startJson?.steps === "number") setStepIndex(Math.min(stepLabels.length, startJson.steps + 1));
         else setStepIndex(stepLabels.length);
         setActiveStepStartedAt(null);
+        setCurrentStepProgressPct(null);
+        setCurrentStepProgressLabel("");
         setResultText(startJson?.summary || "");
         setPipelineLog(startJson?.log || "");
         setWarnings(Array.isArray(startJson?.warnings) ? startJson.warnings : []);
@@ -683,6 +699,8 @@ export default function App() {
     } finally {
       setIsRunning(false);
       setActiveStepStartedAt(null);
+      setCurrentStepProgressPct(null);
+      setCurrentStepProgressLabel("");
       setAbortCtrl(null);
     }
   }
@@ -755,6 +773,8 @@ export default function App() {
                   const stepTitle = stepLabels[step - 1] || `Шаг ${step}`;
                   const inputError = getInputErrorByStep(step);
                   const durationText = getStepDurationText(step);
+                  const showStep1ProgressBar =
+                    step === 1 && isRunningStep && Number.isFinite(currentStepProgressPct) && currentStepProgressPct >= 0;
                   return (
                     <div
                       key={step}
@@ -919,6 +939,20 @@ export default function App() {
                               Начать с этого шага
                             </button>
                           </div>
+                          {showStep1ProgressBar && (
+                            <div className="mt-3">
+                              <div className="mb-1 flex items-center justify-between gap-2 text-xs text-neutral-600">
+                                <span>{currentStepProgressLabel || "Подготовка аудио"}</span>
+                                <span>{Math.round(currentStepProgressPct)}%</span>
+                              </div>
+                              <div className="h-2 overflow-hidden rounded-full bg-neutral-200">
+                                <div
+                                  className="h-full rounded-full bg-emerald-500 transition-all duration-300 ease-out"
+                                  style={{ width: `${Math.max(0, Math.min(100, currentStepProgressPct))}%` }}
+                                />
+                              </div>
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>

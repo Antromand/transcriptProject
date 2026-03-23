@@ -2,16 +2,25 @@
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 
-function runCommand(cmd, args, { cwd, onSpawn } = {}) {
+function runCommand(cmd, args, { cwd, onSpawn, onStdout, onStderr, onClose } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { cwd });
     if (typeof onSpawn === "function") onSpawn(p);
     let out = "";
     let err = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
+    p.stdout.on("data", (d) => {
+      const text = d.toString();
+      out += text;
+      if (typeof onStdout === "function") onStdout(text);
+    });
+    p.stderr.on("data", (d) => {
+      const text = d.toString();
+      err += text;
+      if (typeof onStderr === "function") onStderr(text);
+    });
     p.on("close", (code) => {
       if (typeof onSpawn === "function") onSpawn(null);
+      if (typeof onClose === "function") onClose(code, { out, err });
       if (code === 0) resolve({ out, err });
       else reject(new Error(`${cmd} ${args.join(" ")}\n${err || out}`));
     });
@@ -124,12 +133,14 @@ export class SummaryPipelineService {
     const startStep = (stepIndex) => {
       job.steps = stepIndex;
       job.currentStepStartedAt = Date.now();
+      this.clearStepProgress(job);
     };
 
     const finishStep = (stepIndex) => {
       if (!Number.isFinite(job.currentStepStartedAt)) return;
       job.stepDurationsMs[stepIndex] = Date.now() - job.currentStepStartedAt;
       job.currentStepStartedAt = null;
+      this.clearStepProgress(job);
     };
 
     this.throwIfCanceled(job);
@@ -144,11 +155,12 @@ export class SummaryPipelineService {
         if (!this.existsSync(sourceLocalPath)) {
           throw new Error(`Локальный файл не найден: ${sourceLocalPath}`);
         }
+        const progressHandlers = this.buildStep1ProgressHandlers(job, "local");
         dl = await this.runTrackedCommand(
           job,
           this.ffmpegBin,
           ["-y", "-i", sourceLocalPath, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav],
-          { cwd: jobDir }
+          { cwd: jobDir, ...progressHandlers }
         );
       } else {
         const cookiesFile = this.env.COOKIES_FILE;
@@ -181,20 +193,21 @@ export class SummaryPipelineService {
           if (poToken) ytdlpArgs.push("--extractor-args", `youtube:po_token=${poToken}`);
         }
         ytdlpArgs.push(url);
+        const progressHandlers = this.buildStep1ProgressHandlers(job, "remote");
 
         try {
-          dl = await this.runTrackedCommand(job, this.ytdlpBin, ytdlpArgs, { cwd: jobDir });
+          dl = await this.runTrackedCommand(job, this.ytdlpBin, ytdlpArgs, { cwd: jobDir, ...progressHandlers });
         } catch (error) {
           this.throwIfCanceled(job);
           const msg = String(error?.message || "");
           // Older yt-dlp builds may not have --js-runtimes.
           if (isYoutube && msg.includes("--js-runtimes")) {
             const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--js-runtimes" || ytdlpArgs[idx - 1] === "--js-runtimes"));
-            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir });
+            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir, ...progressHandlers });
             job.warnings.push("yt-dlp не поддерживает --js-runtimes, выполнен повторный запуск без этого флага.");
           } else if (isYoutube && msg.includes("--remote-components")) {
             const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--remote-components" || ytdlpArgs[idx - 1] === "--remote-components"));
-            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir });
+            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir, ...progressHandlers });
             job.warnings.push("yt-dlp не поддерживает --remote-components, выполнен повторный запуск без этого флага.");
           } else {
             throw error;
@@ -395,12 +408,90 @@ export class SummaryPipelineService {
     return `android.gvs+${raw}`;
   }
 
+  parseClockToSeconds(raw) {
+    const m = String(raw || "").match(/(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  }
+
+  setStepProgress(job, percent, label = "") {
+    job.currentStepProgress = {
+      percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null,
+      label: String(label || ""),
+    };
+  }
+
+  clearStepProgress(job) {
+    job.currentStepProgress = { percent: null, label: "" };
+  }
+
+  buildStep1ProgressHandlers(job, mode) {
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let ffmpegDurationSec = null;
+
+    const updateFromLine = (line) => {
+      const text = String(line || "").trim();
+      if (!text) return;
+
+      if (mode === "remote") {
+        const downloadMatch = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+        if (downloadMatch) {
+          this.setStepProgress(job, Number(downloadMatch[1]), "Скачивание аудио");
+          return;
+        }
+        if (/\[extractaudio\]/i.test(text) || /destination:/i.test(text)) {
+          const prev = Number(job.currentStepProgress?.percent);
+          this.setStepProgress(job, Number.isFinite(prev) ? Math.max(prev, 99) : 99, "Конвертация в wav");
+        }
+        return;
+      }
+
+      const durationMatch = text.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/i);
+      if (durationMatch) {
+        ffmpegDurationSec = this.parseClockToSeconds(durationMatch[1]);
+      }
+      const timeMatch = text.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/i);
+      if (timeMatch && ffmpegDurationSec && ffmpegDurationSec > 0) {
+        const currentSec = this.parseClockToSeconds(timeMatch[1]);
+        if (Number.isFinite(currentSec)) {
+          const percent = Math.min(99, (currentSec / ffmpegDurationSec) * 100);
+          this.setStepProgress(job, percent, "Конвертация в wav");
+        }
+      }
+    };
+
+    const feed = (kind, chunk) => {
+      if (kind === "stdout") stdoutBuf += chunk;
+      else stderrBuf += chunk;
+      let buf = kind === "stdout" ? stdoutBuf : stderrBuf;
+      const parts = buf.split(/\r?\n|\r/g);
+      buf = parts.pop() || "";
+      for (const line of parts) updateFromLine(line);
+      if (kind === "stdout") stdoutBuf = buf;
+      else stderrBuf = buf;
+    };
+
+    return {
+      onStdout: (chunk) => feed("stdout", chunk),
+      onStderr: (chunk) => feed("stderr", chunk),
+      onClose: (code) => {
+        if (code === 0) {
+          this.setStepProgress(job, 100, mode === "remote" ? "Аудио подготовлено" : "Конвертация завершена");
+        }
+      },
+    };
+  }
+
   async runTrackedCommand(job, cmd, args, options = {}) {
     return runCommand(cmd, args, {
       ...options,
       onSpawn: (proc) => {
         job.currentProcess = proc;
       },
+      onStdout: options.onStdout,
+      onStderr: options.onStderr,
+      onClose: options.onClose,
     });
   }
 

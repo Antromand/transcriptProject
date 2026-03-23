@@ -25,6 +25,8 @@ export class SummaryJobStore {
       job_id: job.id,
       status: job.status,
       steps: job.steps,
+      current_step_progress_pct: Number.isFinite(job.currentStepProgress?.percent) ? job.currentStepProgress.percent : null,
+      current_step_progress_label: job.currentStepProgress?.label || "",
       warnings: job.warnings,
       step_durations_ms: job.stepDurationsMs,
       current_step_elapsed_ms: currentElapsed,
