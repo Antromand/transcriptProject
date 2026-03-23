@@ -5,6 +5,22 @@ import sys
 import warnings
 import torch
 
+
+def _configure_stdio():
+    # WhisperX prints transcript snippets during decoding. On Windows, the
+    # inherited console encoding may be cp1251/cp866 and fail on emoji/CJK.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_stdio()
+
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
@@ -109,6 +125,13 @@ if "--hf_token" not in sys.argv and "--hf-token" not in sys.argv:
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
         sys.argv.extend(["--hf_token", hf_token])
+
+# Auto language detection can misclassify Russian speech. Default to Russian
+# unless the caller explicitly passes another language.
+if _get_arg("--language") is None:
+    default_language = os.environ.get("WHISPERX_LANGUAGE", "ru").strip()
+    if default_language:
+        _set_arg("--language", default_language)
 
 # WhisperX defaults to CPU+float16 in this setup; choose sane defaults automatically.
 device = _get_arg("--device")

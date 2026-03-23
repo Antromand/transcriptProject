@@ -61,6 +61,9 @@ const SUMMARY_FORMATS = {
   },
 };
 
+const RUSSIAN_ONLY_INSTRUCTION =
+  "Всегда отвечай только на русском языке. Не переходи на китайский, английский или любой другой язык, даже если исходный текст не на русском. Допустимо оставлять оригинальные имена, бренды, термины и короткие цитаты без перевода, но весь пересказ, заголовки и связующий текст должны быть на русском.";
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -213,7 +216,7 @@ export class LLMService {
           {
             role: "system",
             content:
-              `${formatCfg.chunkSystem} В чанке примерно ${chunkWords} слов. Целевой объем для этого чанка: около ${chunkRange.targetWords} слов ` +
+              `${RUSSIAN_ONLY_INSTRUCTION} ${formatCfg.chunkSystem} В чанке примерно ${chunkWords} слов. Целевой объем для этого чанка: около ${chunkRange.targetWords} слов ` +
               `(допустимо ${chunkRange.minWords}-${chunkRange.maxWords}).`,
           },
           { role: "user", content: `Чанк ${i + 1}/${chunks.length}:\n\n${text}` },
@@ -226,7 +229,7 @@ export class LLMService {
         {
           role: "system",
           content:
-            `${formatCfg.finalSystem} Общий объем исходного текста: примерно ${totalSourceWords} слов. ` +
+            `${RUSSIAN_ONLY_INSTRUCTION} ${formatCfg.finalSystem} Общий объем исходного текста: примерно ${totalSourceWords} слов. ` +
             `Целевой объем финального пересказа: около ${finalRange.targetWords} слов ` +
             `(допустимо ${finalRange.minWords}-${finalRange.maxWords}).`,
         },
@@ -242,7 +245,7 @@ export class LLMService {
           {
             role: "system",
             content:
-              `Перепиши пересказ в диапазон ${finalRange.minWords}-${finalRange.maxWords} слов (цель ${finalRange.targetWords}). ` +
+              `${RUSSIAN_ONLY_INSTRUCTION} Перепиши пересказ в диапазон ${finalRange.minWords}-${finalRange.maxWords} слов (цель ${finalRange.targetWords}). ` +
               "Сохрани факты, убери повторы, не добавляй вымышленные детали, формат без буллетов.",
           },
           { role: "user", content: summaryText },
