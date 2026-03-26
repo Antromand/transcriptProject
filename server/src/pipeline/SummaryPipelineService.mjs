@@ -2,9 +2,9 @@
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 
-function runCommand(cmd, args, { cwd, onSpawn, onStdout, onStderr, onClose } = {}) {
+function runCommand(cmd, args, { cwd, env, onSpawn, onStdout, onStderr, onClose } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd });
+    const p = spawn(cmd, args, { cwd, env: env ? { ...process.env, ...env } : process.env });
     if (typeof onSpawn === "function") onSpawn(p);
     let out = "";
     let err = "";
@@ -96,6 +96,95 @@ export class SummaryPipelineService {
     return found;
   }
 
+  buildYtdlpSourceArgs(rawUrl, options = {}) {
+    const sourceUrl = String(rawUrl || "").trim();
+    const isYoutube = this.isYoutubeUrl(sourceUrl);
+    const includeYoutubeExtractorArgs = options.includeYoutubeExtractorArgs !== false;
+    const includeYoutubePoToken = options.includeYoutubePoToken !== false;
+    const cookiesFile = this.env.COOKIES_FILE;
+    const args = ["--encoding", "utf-8"];
+    if (cookiesFile) args.push("--cookies", cookiesFile);
+    if (isYoutube && this.ytdlpJsRuntimes) {
+      const jsRuntimeArgs = this.buildJsRuntimeArgs();
+      if (jsRuntimeArgs.length > 0) args.push(...jsRuntimeArgs);
+    }
+    if (isYoutube && this.ytdlpRemoteComponents) {
+      const remoteComponentArgs = this.buildRemoteComponentArgs();
+      if (remoteComponentArgs.length > 0) args.push(...remoteComponentArgs);
+    }
+    if (isYoutube && includeYoutubeExtractorArgs && this.ytdlpYoutubeExtractorArgs) {
+      args.push("--extractor-args", `youtube:${this.ytdlpYoutubeExtractorArgs}`);
+    }
+    if (isYoutube && includeYoutubePoToken && this.ytdlpYoutubePoToken) {
+      const poToken = this.normalizeYoutubePoToken(this.ytdlpYoutubePoToken);
+      if (poToken) args.push("--extractor-args", `youtube:po_token=${poToken}`);
+    }
+    return args;
+  }
+
+  stripYtdlpOption(args, flag) {
+    const nextArgs = [];
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] === flag) {
+        i += 1;
+        continue;
+      }
+      nextArgs.push(args[i]);
+    }
+    return nextArgs;
+  }
+
+  async runYtdlpCommand(rawUrl, baseArgs, options = {}) {
+    const sourceUrl = String(rawUrl || "").trim();
+    const isYoutube = this.isYoutubeUrl(sourceUrl);
+    const runner =
+      options.job && options.trackWithJob
+        ? (args) =>
+            this.runTrackedCommand(options.job, this.ytdlpBin, args, {
+              cwd: options.cwd,
+              env: { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+              onStdout: options.onStdout,
+              onStderr: options.onStderr,
+              onClose: options.onClose,
+            })
+        : (args) =>
+            runCommand(this.ytdlpBin, args, {
+              cwd: options.cwd,
+              env: { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+              onStdout: options.onStdout,
+              onStderr: options.onStderr,
+              onClose: options.onClose,
+            });
+
+    let args = [...baseArgs, ...this.buildYtdlpSourceArgs(sourceUrl, options.sourceArgOptions), sourceUrl];
+    const compatibilityWarnings = [];
+
+    while (true) {
+      try {
+        const result = await runner(args);
+        if (compatibilityWarnings.length > 0) result.compatibilityWarnings = compatibilityWarnings;
+        return result;
+      } catch (error) {
+        const message = String(error?.message || "");
+        if (!isYoutube) throw error;
+
+        if (message.includes("--js-runtimes") && args.includes("--js-runtimes")) {
+          args = this.stripYtdlpOption(args, "--js-runtimes");
+          compatibilityWarnings.push("yt-dlp не поддерживает --js-runtimes, выполнен повторный запуск без этого флага.");
+          continue;
+        }
+
+        if (message.includes("--remote-components") && args.includes("--remote-components")) {
+          args = this.stripYtdlpOption(args, "--remote-components");
+          compatibilityWarnings.push("yt-dlp не поддерживает --remote-components, выполнен повторный запуск без этого флага.");
+          continue;
+        }
+
+        throw error;
+      }
+    }
+  }
+
   async readChunksFromJobDir(jobDir) {
     const chunkFiles = await this.listCandidateChunkFiles(jobDir);
     if (chunkFiles.length === 0) return [];
@@ -163,10 +252,7 @@ export class SummaryPipelineService {
           { cwd: jobDir, ...progressHandlers }
         );
       } else {
-        const cookiesFile = this.env.COOKIES_FILE;
-        const cookieArgs = cookiesFile ? ["--cookies", cookiesFile] : [];
         const ytdlpArgs = [
-          ...cookieArgs,
           "-x",
           "--audio-format",
           "wav",
@@ -177,42 +263,14 @@ export class SummaryPipelineService {
           "-o",
           wav,
         ];
-        if (isYoutube && this.ytdlpJsRuntimes) {
-          const jsRuntimeArgs = this.buildJsRuntimeArgs();
-          if (jsRuntimeArgs.length > 0) ytdlpArgs.push(...jsRuntimeArgs);
-        }
-        if (isYoutube && this.ytdlpRemoteComponents) {
-          const remoteComponentArgs = this.buildRemoteComponentArgs();
-          if (remoteComponentArgs.length > 0) ytdlpArgs.push(...remoteComponentArgs);
-        }
-        if (isYoutube && this.ytdlpYoutubeExtractorArgs) {
-          ytdlpArgs.push("--extractor-args", `youtube:${this.ytdlpYoutubeExtractorArgs}`);
-        }
-        if (isYoutube && this.ytdlpYoutubePoToken) {
-          const poToken = this.normalizeYoutubePoToken(this.ytdlpYoutubePoToken);
-          if (poToken) ytdlpArgs.push("--extractor-args", `youtube:po_token=${poToken}`);
-        }
-        ytdlpArgs.push(url);
         const progressHandlers = this.buildStep1ProgressHandlers(job, "remote");
-
-        try {
-          dl = await this.runTrackedCommand(job, this.ytdlpBin, ytdlpArgs, { cwd: jobDir, ...progressHandlers });
-        } catch (error) {
-          this.throwIfCanceled(job);
-          const msg = String(error?.message || "");
-          // Older yt-dlp builds may not have --js-runtimes.
-          if (isYoutube && msg.includes("--js-runtimes")) {
-            const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--js-runtimes" || ytdlpArgs[idx - 1] === "--js-runtimes"));
-            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir, ...progressHandlers });
-            job.warnings.push("yt-dlp не поддерживает --js-runtimes, выполнен повторный запуск без этого флага.");
-          } else if (isYoutube && msg.includes("--remote-components")) {
-            const retryArgs = ytdlpArgs.filter((v, idx) => !(v === "--remote-components" || ytdlpArgs[idx - 1] === "--remote-components"));
-            dl = await this.runTrackedCommand(job, this.ytdlpBin, retryArgs, { cwd: jobDir, ...progressHandlers });
-            job.warnings.push("yt-dlp не поддерживает --remote-components, выполнен повторный запуск без этого флага.");
-          } else {
-            throw error;
-          }
-        }
+        dl = await this.runYtdlpCommand(url, ytdlpArgs, {
+          job,
+          trackWithJob: true,
+          cwd: jobDir,
+          ...progressHandlers,
+        });
+        if (Array.isArray(dl.compatibilityWarnings)) job.warnings.push(...dl.compatibilityWarnings);
       }
       this.throwIfCanceled(job);
       finishStep(0);
@@ -414,6 +472,248 @@ export class SummaryPipelineService {
     return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
   }
 
+  formatBytes(rawBytes) {
+    const bytes = Number(rawBytes);
+    if (!Number.isFinite(bytes) || bytes <= 0) return "";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+    return `${value.toFixed(digits)} ${units[unitIndex]}`;
+  }
+
+  buildDownloadOptionLabel(option) {
+    const parts = [];
+    if (option.height) parts.push(`${option.height}p`);
+    else if (option.resolutionLabel) parts.push(option.resolutionLabel);
+
+    if (option.fps && option.fps > 30) parts.push(`${option.fps} fps`);
+    if (option.ext) parts.push(option.ext.toUpperCase());
+    parts.push(option.hasAudio ? "звук встроен" : "аудио добавится");
+    if (option.sizeBytes) parts.push(this.formatBytes(option.sizeBytes));
+    return parts.filter(Boolean).join(" · ");
+  }
+
+  getDownloadOptionScore(option) {
+    const height = Number(option.height) || 0;
+    const fps = Number(option.fps) || 0;
+    const sizeBytes = Number(option.sizeBytes) || 0;
+    const extBonus = option.ext === "mp4" ? 500 : option.ext === "webm" ? 250 : 0;
+    return height * 1_000_000 + fps * 10_000 + (option.hasAudio ? 5_000 : 0) + extBonus + Math.min(sizeBytes, 9_999);
+  }
+
+  normalizeDownloadFormats(info) {
+    const rawFormats = Array.isArray(info?.formats) ? info.formats : [];
+    const byKey = new Map();
+
+    for (const format of rawFormats) {
+      const formatId = String(format?.format_id || "").trim();
+      if (!formatId) continue;
+
+      const vcodec = String(format?.vcodec || "").toLowerCase();
+      if (!vcodec || vcodec === "none") continue;
+
+      const heightRaw = Number.parseInt(String(format?.height || ""), 10);
+      const height = Number.isFinite(heightRaw) && heightRaw > 0 ? heightRaw : null;
+      const fpsRaw = Number.parseInt(String(format?.fps || ""), 10);
+      const fps = Number.isFinite(fpsRaw) && fpsRaw > 0 ? fpsRaw : null;
+      const ext = String(format?.ext || "").trim().toLowerCase();
+      const hasAudio = String(format?.acodec || "").toLowerCase() !== "none";
+      const sizeBytesRaw = Number(format?.filesize || format?.filesize_approx || 0);
+      const sizeBytes = Number.isFinite(sizeBytesRaw) && sizeBytesRaw > 0 ? sizeBytesRaw : null;
+      const resolutionLabel = String(format?.resolution || format?.format_note || formatId).trim();
+
+      const option = {
+        formatId,
+        ext,
+        height,
+        fps,
+        hasAudio,
+        sizeBytes,
+        resolutionLabel,
+      };
+      option.label = this.buildDownloadOptionLabel(option);
+      option.score = this.getDownloadOptionScore(option);
+
+      const dedupeKey = [height || resolutionLabel, fps || 0, ext || "", hasAudio ? "a" : "v"].join("|");
+      const prev = byKey.get(dedupeKey);
+      if (!prev || option.score > prev.score) byKey.set(dedupeKey, option);
+    }
+
+    return Array.from(byKey.values())
+      .sort((a, b) => b.score - a.score || a.label.localeCompare(b.label, "ru"))
+      .slice(0, 24)
+      .map(({ score, ...option }) => ({
+        format_id: option.formatId,
+        label: option.label || option.resolutionLabel || option.formatId,
+        has_audio: option.hasAudio,
+        audio_note: option.hasAudio ? "embedded" : "merged",
+        height: option.height,
+        fps: option.fps,
+        ext: option.ext,
+        size_bytes: option.sizeBytes,
+      }));
+  }
+
+  async listDownloadFormats({ url }) {
+    const sourceUrl = String(url || "").trim();
+    const result = await this.runYtdlpCommand(
+      sourceUrl,
+      ["--dump-single-json", "--no-warnings", "--no-playlist", "--skip-download"],
+      {
+        sourceArgOptions: {
+          includeYoutubeExtractorArgs: false,
+          includeYoutubePoToken: false,
+        },
+      }
+    );
+
+    let payload = null;
+    try {
+      payload = JSON.parse(result.out);
+    } catch {
+      throw new Error("Не удалось получить список качеств от yt-dlp.");
+    }
+
+    const formats = this.normalizeDownloadFormats(payload);
+    const warnings = [...(Array.isArray(result.compatibilityWarnings) ? result.compatibilityWarnings : [])];
+    const maxHeight = formats.reduce((max, format) => Math.max(max, Number(format?.height) || 0), 0);
+    if (this.isYoutubeUrl(sourceUrl) && maxHeight > 0 && maxHeight <= 360) {
+      warnings.push(
+        "YouTube вернул только низкие качества. Обычно это ограничение источника: проверьте актуальность yt-dlp, COOKIES_FILE и при необходимости YTDLP_YOUTUBE_PO_TOKEN."
+      );
+    }
+
+    return {
+      title: String(payload?.title || "").trim(),
+      formats,
+      warnings,
+    };
+  }
+
+  buildVideoDownloadFormatSelector(formatId, hasAudio, ext) {
+    const normalizedId = String(formatId || "").trim();
+    const normalizedExt = String(ext || "").trim().toLowerCase();
+    if (!normalizedId || normalizedId.toLowerCase() === "best") return "bestvideo+bestaudio/best";
+    if (hasAudio === false) {
+      if (normalizedExt === "webm") return `${normalizedId}+bestaudio[ext=webm]/${normalizedId}+bestaudio/best`;
+      if (normalizedExt === "mp4" || normalizedExt === "m4a") return `${normalizedId}+bestaudio[ext=m4a]/${normalizedId}+bestaudio/best`;
+      return `${normalizedId}+bestaudio/best`;
+    }
+    return normalizedId;
+  }
+
+  sanitizeDownloadName(rawName) {
+    const safe = String(rawName || "")
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return safe.slice(0, 180) || "video";
+  }
+
+  async findPreparedDownloadFile(targetDir) {
+    let entries = [];
+    try {
+      entries = await fs.readdir(targetDir, { withFileTypes: true });
+    } catch {
+      return "";
+    }
+
+    const candidates = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const lower = entry.name.toLowerCase();
+      if (lower.endsWith(".part") || lower.endsWith(".ytdl")) continue;
+      if (!/\.(mp4|mkv|webm|mov|avi|m4v|flv)$/i.test(lower)) continue;
+      const fullPath = path.join(targetDir, entry.name);
+      try {
+        const stat = await fs.stat(fullPath);
+        candidates.push({ fullPath, mtimeMs: stat.mtimeMs || 0 });
+      } catch {}
+    }
+
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return candidates[0]?.fullPath || "";
+  }
+
+  async downloadVideo({ url, formatId = "", hasAudio = null, ext = "", targetDir, job = null }) {
+    const sourceUrl = String(url || "").trim();
+    const outputTemplate = path.join(targetDir, "video.%(ext)s");
+    const requestedExt = String(ext || "").trim().toLowerCase();
+    const mergeOutputFormat =
+      requestedExt && ["mp4", "webm", "mkv", "mov"].includes(requestedExt) ? requestedExt : hasAudio === false ? "mkv" : "";
+    await fs.mkdir(targetDir, { recursive: true });
+    const progressHandlers = job ? this.buildVideoDownloadProgressHandlers(job) : {};
+    if (job) {
+      job.steps = 0;
+      job.currentStepStartedAt = Date.now();
+      this.setStepProgress(job, 0, "Подготовка скачивания");
+    }
+
+    const result = await this.runYtdlpCommand(
+      sourceUrl,
+      [
+        "--no-playlist",
+        "--no-warnings",
+        "--progress",
+        "--newline",
+        "--print",
+        "before_dl:%(title)s",
+        "--print",
+        "after_move:%(filepath)s",
+        "-f",
+        this.buildVideoDownloadFormatSelector(formatId, hasAudio, requestedExt),
+        "-o",
+        outputTemplate,
+        ...(mergeOutputFormat ? ["--merge-output-format", mergeOutputFormat] : []),
+      ],
+      {
+        cwd: targetDir,
+        job,
+        trackWithJob: Boolean(job),
+        ...progressHandlers,
+        sourceArgOptions: {
+          includeYoutubeExtractorArgs: false,
+          includeYoutubePoToken: false,
+        },
+      }
+    );
+
+    const lines = String(result.out || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    let filePath = "";
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (this.existsSync(lines[i])) {
+        filePath = lines[i];
+        break;
+      }
+    }
+    if (!filePath) filePath = await this.findPreparedDownloadFile(targetDir);
+    if (!filePath || !this.existsSync(filePath)) {
+      throw new Error("yt-dlp не сохранил видеофайл.");
+    }
+
+    const fileExt = path.extname(filePath) || ".mp4";
+    const titleLine = lines.find((line) => line !== filePath && !this.existsSync(line)) || "";
+    const fileName = `${this.sanitizeDownloadName(titleLine)}${fileExt}`;
+    const stat = await fs.stat(filePath);
+
+    return {
+      filePath,
+      fileName,
+      title: this.sanitizeDownloadName(titleLine),
+      sizeBytes: Number.isFinite(stat?.size) ? stat.size : null,
+      warnings: Array.isArray(result.compatibilityWarnings) ? result.compatibilityWarnings : [],
+    };
+  }
+
   setStepProgress(job, percent, label = "") {
     job.currentStepProgress = {
       percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null,
@@ -479,6 +779,60 @@ export class SummaryPipelineService {
         if (code === 0) {
           this.setStepProgress(job, 100, mode === "remote" ? "Аудио подготовлено" : "Конвертация завершена");
         }
+      },
+    };
+  }
+
+  buildVideoDownloadProgressHandlers(job) {
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let phase = 0;
+    let lastRawPercent = 0;
+
+    const updateFromLine = (line) => {
+      const text = String(line || "").trim();
+      if (!text) return;
+
+      const downloadMatch = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/i);
+      if (downloadMatch) {
+        const rawPercent = Number(downloadMatch[1]);
+        if (Number.isFinite(rawPercent)) {
+          if (rawPercent + 5 < lastRawPercent) phase = Math.min(2, phase + 1);
+          lastRawPercent = rawPercent;
+          const mappedPercent =
+            phase === 0 ? rawPercent * 0.85 : phase === 1 ? 85 + rawPercent * 0.13 : 98 + rawPercent * 0.01;
+          this.setStepProgress(job, mappedPercent, phase === 0 ? "Скачивание видео" : "Скачивание аудио");
+        }
+        return;
+      }
+
+      const destinationMatch = text.match(/\[download\]\s+Destination:/i);
+      if (destinationMatch) {
+        if (phase === 0 && lastRawPercent > 0) phase = 1;
+        return;
+      }
+
+      if (/\[merger\]/i.test(text) || /merging formats/i.test(text) || /fixing/i.test(text)) {
+        this.setStepProgress(job, 99, "Сборка файла");
+      }
+    };
+
+    const feed = (kind, chunk) => {
+      if (kind === "stdout") stdoutBuf += chunk;
+      else stderrBuf += chunk;
+      let buf = kind === "stdout" ? stdoutBuf : stderrBuf;
+      const parts = buf.split(/\r?\n|\r/g);
+      buf = parts.pop() || "";
+      for (const line of parts) updateFromLine(line);
+      if (kind === "stdout") stdoutBuf = buf;
+      else stderrBuf = buf;
+    };
+
+    return {
+      onStdout: (chunk) => feed("stdout", chunk),
+      onStderr: (chunk) => feed("stderr", chunk),
+      onClose: (code) => {
+        if (code === 0) this.setStepProgress(job, 100, "Файл готов");
       },
     };
   }

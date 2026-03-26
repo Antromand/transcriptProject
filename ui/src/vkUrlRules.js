@@ -4,6 +4,7 @@ const YOUTUBE_HOST = "youtube.com";
 const YOUTU_BE_HOST = "youtu.be";
 const TWITCH_HOST = "twitch.tv";
 const TWITCH_CLIPS_HOST = "clips.twitch.tv";
+const KICK_HOST = "kick.com";
 
 function isHostOrSubdomain(host, root) {
   return host === root || host.endsWith(`.${root}`);
@@ -78,10 +79,34 @@ function isValidTwitchUrl(url) {
   return false;
 }
 
+function isValidKickUrl(url) {
+  const host = url.hostname.toLowerCase();
+  if (!isHostOrSubdomain(host, KICK_HOST)) return false;
+
+  const parts = (url.pathname || "").split("/").filter(Boolean);
+  const clipId = (url.searchParams.get("clip") || "").trim();
+
+  if (parts.length === 1) {
+    const channel = parts[0] || "";
+    if (/^[A-Za-z0-9_.-]{2,}$/.test(channel)) return true;
+    return /^[A-Za-z0-9_-]{6,}$/.test(clipId);
+  }
+
+  if (parts.length >= 3 && parts[1].toLowerCase() === "videos") {
+    return /^[A-Za-z0-9-]{6,}$/.test(parts[2] || "");
+  }
+
+  if (parts.length >= 3 && parts[1].toLowerCase() === "clips") {
+    return /^[A-Za-z0-9_-]{6,}$/.test(parts[2] || "");
+  }
+
+  return false;
+}
+
 export function isSupportedVideoUrl(rawUrl) {
   try {
     const url = new URL(rawUrl.trim());
-    return isValidVkMask(rawUrl) || isValidYoutubeUrl(url) || isValidTwitchUrl(url);
+    return isValidVkMask(rawUrl) || isValidYoutubeUrl(url) || isValidTwitchUrl(url) || isValidKickUrl(url);
   } catch {
     return false;
   }

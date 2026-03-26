@@ -2,7 +2,7 @@
 import { isSupportedVideoUrl } from "./vkUrlRules";
 
 /**
- * MVP (VK/YouTube/Twitch)
+ * MVP (VK/YouTube/Twitch/Kick)
  * UI вызывает backend endpoint, который выполняет пайплайн:
  * 1) download mp4
  * 2) ffmpeg -> wav
@@ -186,9 +186,32 @@ function buildStepLabels(providerId, summaryFormat) {
   return [...BASE_STEP_LABELS, `${summaryLabel} пересказ (${llmLabel})`];
 }
 
+function getVideoUrlValidationError(rawUrl) {
+  const trimmed = String(rawUrl || "").trim();
+  if (!trimmed) return "Введите ссылку на видео (VK, YouTube, Twitch или Kick).";
+
+  try {
+    // eslint-disable-next-line no-new
+    new URL(trimmed);
+  } catch {
+    return "Ссылка выглядит некорректно. Примеры: https://youtu.be/dQw4w9WgXcQ, https://www.twitch.tv/videos/123456789 или https://kick.com/user/videos/1234abcd";
+  }
+
+  if (!isSupportedVideoUrl(trimmed)) {
+    return "Ссылка не поддерживается. Подходят форматы VK, YouTube (watch/shorts/youtu.be), Twitch (videos/clips) и Kick (channel/videos/clips).";
+  }
+
+  return "";
+}
+
 export default function App() {
   const [url, setUrl] = useState("");
   const isLinkValid = useMemo(() => url.trim().length > 0 && isSupportedVideoUrl(url), [url]);
+  const [downloadUrl, setDownloadUrl] = useState("");
+  const isDownloadLinkValid = useMemo(
+    () => downloadUrl.trim().length > 0 && isSupportedVideoUrl(downloadUrl),
+    [downloadUrl]
+  );
   const [sourceType, setSourceType] = useState("url");
   const [localVideoFile, setLocalVideoFile] = useState(null);
   const [startStep, setStartStep] = useState(1);
@@ -233,6 +256,18 @@ export default function App() {
   const [abortCtrl, setAbortCtrl] = useState(null);
   const [currentJobId, setCurrentJobId] = useState("");
   const [error, setError] = useState("");
+  const [downloadFormats, setDownloadFormats] = useState([]);
+  const [downloadFormatId, setDownloadFormatId] = useState("best");
+  const [downloadFormatsUrl, setDownloadFormatsUrl] = useState("");
+  const [downloadTitle, setDownloadTitle] = useState("");
+  const [downloadWarnings, setDownloadWarnings] = useState([]);
+  const [downloadBusy, setDownloadBusy] = useState(false);
+  const [downloadFormatsBusy, setDownloadFormatsBusy] = useState(false);
+  const [downloadJobId, setDownloadJobId] = useState("");
+  const [downloadProgressPct, setDownloadProgressPct] = useState(null);
+  const [downloadProgressLabel, setDownloadProgressLabel] = useState("");
+  const [downloadMessage, setDownloadMessage] = useState("");
+  const [downloadError, setDownloadError] = useState("");
   const [llmKeys, setLlmKeys] = useState({
     openai: "",
     deepseek: "",
@@ -256,6 +291,11 @@ export default function App() {
   const selectedProvider = useMemo(
     () => LLM_OPTIONS.find((p) => p.id === llmProvider) || LLM_OPTIONS[0],
     [llmProvider]
+  );
+  const downloadInputError = useMemo(() => getVideoUrlValidationError(downloadUrl), [downloadUrl]);
+  const selectedDownloadFormat = useMemo(
+    () => downloadFormats.find((format) => format.format_id === downloadFormatId) || null,
+    [downloadFormats, downloadFormatId]
   );
   function scrollToResultSmooth() {
     const target = resultSectionRef.current;
@@ -283,17 +323,8 @@ export default function App() {
         if (!localVideoFile) return "Выберите локальный видеофайл.";
         return "";
       }
-      if (!trimmed) return "Введите ссылку на видео (VK, YouTube или Twitch).";
-      try {
-        // eslint-disable-next-line no-new
-        new URL(trimmed);
-      } catch {
-        return "Ссылка выглядит некорректно. Пример: https://youtu.be/... или https://www.twitch.tv/videos/...";
-      }
-      if (!isSupportedVideoUrl(trimmed)) {
-        return "Поддерживаются ссылки VK, YouTube и Twitch.";
-      }
-      return "";
+      if (!trimmed) return "Введите ссылку на видео (VK, YouTube, Twitch или Kick).";
+      return getVideoUrlValidationError(trimmed);
     }
 
     if (step === 2) {
@@ -557,25 +588,9 @@ export default function App() {
           return;
         }
       } else {
-        if (!trimmed) {
-          setError("Введите ссылку на видео (VK, YouTube или Twitch).");
-          return;
-        }
-
-        try {
-          // eslint-disable-next-line no-new
-          new URL(trimmed);
-        } catch {
-          setError(
-            "Ссылка выглядит некорректно. Примеры: https://youtu.be/dQw4w9WgXcQ или https://www.twitch.tv/videos/123456789"
-          );
-          return;
-        }
-
-        if (!isSupportedVideoUrl(trimmed)) {
-          setError(
-            "Ссылка не поддерживается. Подходят форматы VK, YouTube (watch/shorts/youtu.be) и Twitch (videos/clips)."
-          );
+        const urlError = getVideoUrlValidationError(trimmed);
+        if (urlError) {
+          setError(urlError);
           return;
         }
       }
@@ -716,6 +731,124 @@ export default function App() {
     }
   }
 
+  function onDownloadUrlChange(nextValue) {
+    setDownloadUrl(nextValue);
+    setDownloadError("");
+    setDownloadMessage("");
+    setDownloadWarnings([]);
+    setDownloadJobId("");
+    setDownloadProgressPct(null);
+    setDownloadProgressLabel("");
+
+    if (nextValue.trim() !== downloadFormatsUrl) {
+      setDownloadFormats([]);
+      setDownloadFormatId("best");
+      setDownloadFormatsUrl("");
+      setDownloadTitle("");
+    }
+  }
+
+  async function onLoadDownloadFormats() {
+    setDownloadError("");
+    setDownloadMessage("");
+    setDownloadWarnings([]);
+
+    if (downloadInputError) {
+      setDownloadError(downloadInputError);
+      return;
+    }
+
+    setDownloadFormatsBusy(true);
+    try {
+      const trimmed = downloadUrl.trim();
+      const data = await postJson("/api/video/download/formats", { url: trimmed });
+      const nextFormats = Array.isArray(data?.formats) ? data.formats : [];
+      setDownloadFormats(nextFormats);
+      setDownloadFormatId("best");
+      setDownloadFormatsUrl(trimmed);
+      setDownloadTitle(data?.title || "");
+      setDownloadWarnings(Array.isArray(data?.warnings) ? data.warnings : []);
+      setDownloadMessage(
+        nextFormats.length > 0
+          ? `Качества загружены${data?.title ? ` для "${data.title}"` : ""}.`
+          : "Отдельные качества не найдены. Можно скачать лучшее доступное видео."
+      );
+    } catch (e) {
+      setDownloadError(e?.message || "Не удалось получить список качеств.");
+    } finally {
+      setDownloadFormatsBusy(false);
+    }
+  }
+
+  async function onDownloadVideo() {
+    setDownloadError("");
+    setDownloadMessage("");
+    setDownloadWarnings([]);
+    setDownloadProgressPct(null);
+    setDownloadProgressLabel("");
+    setDownloadJobId("");
+
+    if (downloadInputError) {
+      setDownloadError(downloadInputError);
+      return;
+    }
+
+    setDownloadBusy(true);
+    try {
+      const data = await postJson("/api/video/download/start", {
+        url: downloadUrl.trim(),
+        format_id: downloadFormatId === "best" ? "" : downloadFormatId,
+        has_audio: selectedDownloadFormat ? selectedDownloadFormat.has_audio : null,
+        ext: selectedDownloadFormat ? selectedDownloadFormat.ext : "",
+      });
+      if (!data?.job_id) throw new Error("Сервер не вернул id задачи скачивания.");
+      setDownloadJobId(data.job_id);
+
+      while (true) {
+        await delay(700);
+        const statusJson = await getJson(`/api/video/download/status/${data.job_id}`);
+        setDownloadProgressPct(
+          Number.isFinite(statusJson?.current_step_progress_pct) ? statusJson.current_step_progress_pct : null
+        );
+        setDownloadProgressLabel(statusJson?.current_step_progress_label || "");
+        setDownloadWarnings(Array.isArray(statusJson?.warnings) ? statusJson.warnings : []);
+
+        if (statusJson?.status === "done") {
+          setDownloadJobId("");
+          setDownloadProgressPct(100);
+          setDownloadProgressLabel("Файл готов");
+          if (statusJson?.title) setDownloadTitle(statusJson.title);
+          if (!statusJson?.download_url) {
+            throw new Error("Сервер не вернул ссылку на скачивание.");
+          }
+
+          const link = document.createElement("a");
+          link.href = statusJson.download_url;
+          if (statusJson.file_name) link.download = statusJson.file_name;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+
+          setDownloadMessage(
+            statusJson?.file_name ? `Скачивание началось: ${statusJson.file_name}` : "Файл подготовлен, скачивание началось."
+          );
+          break;
+        }
+
+        if (statusJson?.status === "error") {
+          setDownloadJobId("");
+          setDownloadProgressPct(null);
+          setDownloadProgressLabel("");
+          throw new Error(statusJson?.error || "Не удалось скачать видео.");
+        }
+      }
+    } catch (e) {
+      setDownloadError(e?.message || "Не удалось скачать видео.");
+    } finally {
+      setDownloadBusy(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-neutral-50 text-neutral-900">
       <div className="mx-auto max-w-3xl p-6">
@@ -736,6 +869,18 @@ export default function App() {
               }`}
             >
               Запуск
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("download")}
+              disabled={isRunning}
+              className={`rounded-xl px-3 py-2 text-sm ring-1 ${
+                activeTab === "download"
+                  ? "bg-neutral-900 text-white ring-neutral-900"
+                  : "bg-white text-neutral-900 ring-neutral-200 hover:bg-neutral-50"
+              }`}
+            >
+              Скачать видео
             </button>
             <button
               type="button"
@@ -960,6 +1105,127 @@ export default function App() {
                 })}
               </div>
               <div className="mt-3 text-xs text-neutral-600">Что будет выполнено: {routeHint}</div>
+            </div>
+              </>
+            )}
+
+            {activeTab === "download" && (
+              <>
+            <div className="rounded-2xl border border-neutral-200 p-4">
+              <div className="text-sm font-medium">Скачать видео по ссылке</div>
+              <div className="mt-1 text-xs text-neutral-600">
+                Отдельная загрузка без транскрибации и пересказа. Если yt-dlp вернет форматы, можно выбрать качество.
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                <label className="text-xs font-medium text-neutral-600">Ссылка на видео</label>
+                <div className="flex gap-2">
+                  <input
+                    value={downloadUrl}
+                    onChange={(e) => onDownloadUrlChange(e.target.value)}
+                    disabled={isRunning || downloadBusy || downloadFormatsBusy}
+                    className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                  />
+                  <div className="shrink-0 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                    <span className="text-neutral-500">Ссылка:</span>{" "}
+                    <span
+                      className={`font-medium ${
+                        !downloadUrl.trim() ? "text-neutral-400" : isDownloadLinkValid ? "text-emerald-600" : "text-red-600"
+                      }`}
+                    >
+                      {!downloadUrl.trim() ? "—" : isDownloadLinkValid ? "верная" : "не подходит"}
+                    </span>
+                  </div>
+                </div>
+
+                {downloadTitle && (
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm">
+                    <span className="text-neutral-500">Видео:</span> <span className="font-medium">{downloadTitle}</span>
+                  </div>
+                )}
+
+                <label className="text-xs font-medium text-neutral-600">Качество</label>
+                <select
+                  value={downloadFormatId}
+                  onChange={(e) => setDownloadFormatId(e.target.value)}
+                  disabled={isRunning || downloadBusy || downloadFormatsBusy}
+                  className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-300"
+                >
+                  <option value="best">Лучшее доступное</option>
+                  {downloadFormats.map((format) => (
+                    <option key={format.format_id} value={format.format_id}>
+                      {format.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="text-xs text-neutral-500">
+                  Для YouTube высокие качества часто идут как отдельное видео. Если в списке указано "аудио добавится", итоговый файл будет
+                  собран со звуком.
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={onLoadDownloadFormats}
+                    disabled={isRunning || downloadBusy || downloadFormatsBusy || Boolean(downloadInputError)}
+                    className="rounded-xl px-3 py-2 text-sm ring-1 ring-neutral-200 hover:bg-neutral-50 disabled:opacity-50"
+                  >
+                    {downloadFormatsBusy ? "Загружаю..." : "Показать качества"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onDownloadVideo}
+                    disabled={isRunning || downloadBusy || downloadFormatsBusy || Boolean(downloadInputError)}
+                    className="rounded-xl bg-neutral-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+                  >
+                    {downloadBusy ? "Готовлю файл..." : "Скачать видео"}
+                  </button>
+                </div>
+
+                <div className={`text-xs ${downloadInputError ? "text-red-600" : "text-neutral-600"}`}>
+                  {downloadInputError
+                    ? downloadInputError
+                    : downloadFormatsUrl === downloadUrl.trim() && downloadFormats.length > 0
+                    ? `Найдено вариантов качества: ${downloadFormats.length}.`
+                    : "Если не загружать список качеств, будет использовано лучшее доступное качество."}
+                </div>
+
+                {downloadBusy && (
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-3">
+                    <div className="mb-2 flex items-center justify-between gap-2 text-xs text-neutral-600">
+                      <span>{downloadProgressLabel || "Подготовка скачивания"}</span>
+                      <span>{Number.isFinite(downloadProgressPct) ? `${Math.round(downloadProgressPct)}%` : "..."}</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-neutral-200">
+                      <div
+                        className="h-full rounded-full bg-emerald-500 transition-all duration-300 ease-out"
+                        style={{ width: `${Math.max(4, Math.min(100, Number.isFinite(downloadProgressPct) ? downloadProgressPct : 8))}%` }}
+                      />
+                    </div>
+                    {downloadJobId && <div className="mt-2 text-[11px] text-neutral-500">Задача: {downloadJobId}</div>}
+                  </div>
+                )}
+
+                {downloadWarnings.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                    {downloadWarnings.map((warning, index) => (
+                      <div key={`${warning}-${index}`}>{warning}</div>
+                    ))}
+                  </div>
+                )}
+
+                {downloadError && (
+                  <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+                    {downloadError}
+                  </div>
+                )}
+
+                {downloadMessage && (
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                    {downloadMessage}
+                  </div>
+                )}
+              </div>
             </div>
               </>
             )}
@@ -1229,6 +1495,7 @@ export default function App() {
           </div>
         </section>
 
+        {activeTab === "run" && (
         <section ref={resultSectionRef} className="mt-6 rounded-2xl bg-white shadow-sm ring-1 ring-neutral-200 p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-base font-semibold">Результат</h2>
@@ -1264,9 +1531,12 @@ export default function App() {
             </div>
           )}
         </section>
+        )}
 
         <footer className="mt-6 text-xs text-neutral-500">
-          MVP: запуск с шагов 1-4. Для backend нужны: yt-dlp/ffmpeg (если старт с шага 1), python + whisperx (если старт с шага 1-2), HF_TOKEN и ключ выбранного LLM.
+          {activeTab === "download"
+            ? "Для прямой загрузки нужен yt-dlp на сервере. Если сайт отдает список форматов, можно выбрать качество перед скачиванием."
+            : "MVP: запуск с шагов 1-4. Для backend нужны: yt-dlp/ffmpeg (если старт с шага 1), python + whisperx (если старт с шага 1-2), HF_TOKEN и ключ выбранного LLM."}
         </footer>
       </div>
 

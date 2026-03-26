@@ -33,6 +33,11 @@ export class SummaryJobStore {
       log: job.wantLog ? job.log : "",
       summary: job.status === "done" ? job.summary : "",
       error: job.status === "error" || job.status === "canceled" ? job.error : "",
+      title: job.status === "done" ? job.title || "" : "",
+      file_id: job.status === "done" ? job.fileId || "" : "",
+      file_name: job.status === "done" ? job.fileName || "" : "",
+      size_bytes: job.status === "done" ? job.sizeBytes ?? null : null,
+      download_url: job.status === "done" ? job.downloadUrl || "" : "",
     };
   }
 }

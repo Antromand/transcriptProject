@@ -10,6 +10,8 @@ import { SummaryJobStore } from "./src/jobs/SummaryJobStore.mjs";
 import { AuditLogger } from "./src/logging/AuditLogger.mjs";
 import { EnvService } from "./src/env/EnvService.mjs";
 import { SummaryController } from "./src/controllers/SummaryController.mjs";
+import { VideoDownloadController } from "./src/controllers/VideoDownloadController.mjs";
+import { PreparedDownloadStore } from "./src/download/PreparedDownloadStore.mjs";
 
 const config = new AppConfig({ env: process.env, cwd: process.cwd() });
 
@@ -35,10 +37,17 @@ const pipelineService = new SummaryPipelineService({
   env: process.env,
 });
 const jobStore = new SummaryJobStore({ ttlMs: 30 * 60 * 1000 });
+const downloadJobStore = new SummaryJobStore({ ttlMs: 30 * 60 * 1000 });
 const auditLogger = new AuditLogger({
   workRoot: config.workRoot,
   auditLogPath: config.auditLogPath,
   keepLastRecords: config.auditLogKeepLast,
+});
+const preparedDownloadStore = new PreparedDownloadStore({
+  ttlMs: 20 * 60 * 1000,
+  onExpire: async (entry) => {
+    await fs.rm(entry.dirPath, { recursive: true, force: true }).catch(() => {});
+  },
 });
 const summaryController = new SummaryController({
   isSupportedVideoUrl,
@@ -48,6 +57,12 @@ const summaryController = new SummaryController({
   auditLogger,
   envService,
   workResultsKeepLast: config.workResultsKeepLast,
+});
+const videoDownloadController = new VideoDownloadController({
+  isSupportedVideoUrl,
+  pipelineService,
+  preparedDownloadStore,
+  jobStore: downloadJobStore,
 });
 
 app.get("/api/env/status", (_req, res) => {
@@ -71,6 +86,11 @@ app.get("/api/video/summary/status/:jobId", (req, res) => summaryController.getS
 app.post("/api/video/summary", (req, res) => summaryController.create(req, res));
 app.post("/api/video/summary/cancel/:jobId", (req, res) => summaryController.cancel(req, res));
 app.post("/api/pipeline/summary", (req, res) => summaryController.createFromStart(req, res));
+app.post("/api/video/download/formats", (req, res) => videoDownloadController.listFormats(req, res));
+app.post("/api/video/download/start", (req, res) => videoDownloadController.start(req, res));
+app.get("/api/video/download/status/:jobId", (req, res) => videoDownloadController.getStatus(req, res));
+app.post("/api/video/download/prepare", (req, res) => videoDownloadController.prepare(req, res));
+app.get("/api/video/download/file/:fileId", (req, res) => videoDownloadController.sendFile(req, res));
 
 if (existsSync(config.uiDist)) {
   app.use(express.static(config.uiDist));
