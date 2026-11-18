@@ -159,6 +159,7 @@ npm run start
 - `YTDLP_REMOTE_COMPONENTS` (по умолчанию `ejs:github`)
 - `YTDLP_YOUTUBE_EXTRACTOR_ARGS` (по умолчанию `player_client=android,web`)
 - `YTDLP_YOUTUBE_PO_TOKEN` (если нужен `po_token` для YouTube)
+- `YTDLP_YOUTUBE_PROXY` — адрес прокси только для запросов yt-dlp к YouTube. Например, перед `npm run dev` в PowerShell выполните `$env:YTDLP_YOUTUBE_PROXY = 'socks5://127.0.0.1:1080'`, если на этом порту работает локальный SOCKS-прокси.
 
 Примечание по YouTube:
 - `YTDLP_YOUTUBE_EXTRACTOR_ARGS` и `YTDLP_YOUTUBE_PO_TOKEN` используются в пайплайне пересказа

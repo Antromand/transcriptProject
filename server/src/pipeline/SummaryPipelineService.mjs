@@ -103,6 +103,8 @@ export class SummaryPipelineService {
     const includeYoutubePoToken = options.includeYoutubePoToken !== false;
     const cookiesFile = this.env.COOKIES_FILE;
     const args = ["--encoding", "utf-8"];
+    const youtubeProxy = this.env.YTDLP_YOUTUBE_PROXY?.trim();
+    if (isYoutube && youtubeProxy) args.push("--proxy", youtubeProxy);
     if (cookiesFile) args.push("--cookies", cookiesFile);
     if (isYoutube && this.ytdlpJsRuntimes) {
       const jsRuntimeArgs = this.buildJsRuntimeArgs();
